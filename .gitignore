@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+wandb/
+runs/
+videos/
+checkpoints/
+*.pyc
+.DS_Store

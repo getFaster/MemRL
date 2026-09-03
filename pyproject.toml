@@ -1,0 +1,44 @@
+[project]
+name = "memrl"
+version = "0.1.0"
+description = "Retrieval-augmented JAX PPO for Atari Frostbite"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "flax>=0.10.4",
+  "gymnasium[atari]>=1.1.1",
+  "imageio-ffmpeg>=0.6.0",
+  "jax>=0.5.3",
+  "numpy>=2.0",
+  "optax>=0.2.4",
+  "tyro>=0.9.17",
+  "wandb>=0.19.8",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]>=0.5.3"]
+dev = ["pytest>=8.3", "ruff>=0.11"]
+
+[project.scripts]
+memrl-train = "memrl.train:main"
+memrl-eval = "memrl.evaluate:main"
+memrl-smoke = "memrl.smoke:main"
+memrl-matrix = "memrl.matrix:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
