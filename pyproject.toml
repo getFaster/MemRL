@@ -11,6 +11,7 @@ dependencies = [
   "jax>=0.5.3",
   "numpy>=2.0",
   "optax>=0.2.4",
+  "pillow>=11.0",
   "tyro>=0.9.17",
   "wandb>=0.19.8",
 ]
