@@ -26,6 +26,7 @@ memrl-train = "memrl.train:main"
 memrl-eval = "memrl.evaluate:main"
 memrl-smoke = "memrl.smoke:main"
 memrl-matrix = "memrl.matrix:main"
+memrl-canary = "memrl.canary:main"
 memrl-benchmark = "memrl.benchmark:main"
 memrl-analyze = "memrl.analyze:main"
 

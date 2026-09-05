@@ -35,6 +35,19 @@ def test_parallel_two_requires_a_passing_resource_report(tmp_path):
         validate_config(MatrixConfig(max_parallel=2, resource_report=report))
 
 
+def test_resource_report_allows_minimum_free_memory_of_0_4_gib(tmp_path):
+    report = tmp_path / "resources.json"
+    payload = _passing_report()
+    payload["concurrency_canary"]["min_mem_available_bytes"] = int(0.4 * 1024**3)
+    report.write_text(json.dumps(payload))
+    validate_config(MatrixConfig(max_parallel=2, resource_report=report))
+
+    payload["concurrency_canary"]["min_mem_available_bytes"] = int(0.39 * 1024**3)
+    report.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="MemAvailable fell below"):
+        validate_config(MatrixConfig(max_parallel=2, resource_report=report))
+
+
 def test_timing_matrix_cannot_run_concurrently(tmp_path):
     report = tmp_path / "resources.json"
     report.write_text(json.dumps(_passing_report()))

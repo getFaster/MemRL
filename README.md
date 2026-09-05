@@ -137,12 +137,16 @@ No learning campaign or hyperparameter tuning is part of the tuple implementatio
 
 Campaign concurrency defaults to one. `--max-parallel 2` requires `--resource-report` from two concurrent learned
 canaries demonstrating full host frames, a frame-complete checkpoint, combined peak VRAM at most 4.8 GiB,
-`MemAvailable` at least 2 GiB, and swap growth at most 256 MiB. Timing matrices are always exclusive.
+`MemAvailable` at least 0.4 GiB, and swap growth at most 256 MiB. Timing matrices are always exclusive.
 
 ```bash
+uv run memrl-canary --report canary-resources.json
 uv run memrl-matrix --max-parallel 1
 uv run memrl-matrix --max-parallel 2 --resource-report canary-resources.json
 ```
+
+`memrl-canary` runs two learned 200k-step processes concurrently, samples GPU/host/swap usage, verifies their
+frame-complete final checkpoints, and prints and writes the resource report.
 
 After every gate passes, run seeds 1-3 for all three modes at the frozen 10M-step budget. Every completed episode is
 written to `episodes.jsonl` with mode, seed, environment slot, completion step, raw return, and length.

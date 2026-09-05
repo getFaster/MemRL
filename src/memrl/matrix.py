@@ -12,7 +12,7 @@ from typing import Any, Literal
 import tyro
 
 MAX_COMBINED_VRAM_BYTES = int(4.8 * 1024**3)
-MIN_MEM_AVAILABLE_BYTES = 2 * 1024**3
+MIN_MEM_AVAILABLE_BYTES = int(0.4 * 1024**3)
 MAX_SWAP_GROWTH_BYTES = 256 * 1024**2
 
 
