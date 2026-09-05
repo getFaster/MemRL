@@ -52,7 +52,7 @@ def run_smoke(config: SmokeConfig) -> None:
                 base,
                 retrieval_mode=mode,
                 # Legacy baselines may retain this unused retrieval setting.
-                memory_dim=256 if mode == "none" else 512,
+                memory_dim=256 if mode == "none" else None,
                 seed=config.seed + offset,
                 total_timesteps=iterations * config.num_envs * config.num_steps,
             )

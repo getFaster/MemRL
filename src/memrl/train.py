@@ -26,6 +26,22 @@ def _finite_float(value: Any) -> float:
     return result
 
 
+def record_transition(memory, observation_embedding, action, info, episode_ids, timesteps, action_dim):
+    """Store completed transitions; EnvPool reset calls do not execute actions.
+
+    The embedding and metadata belong to the observation *before* the step.
+    Call only after retrieval/action selection and the environment response.
+    """
+    import jax.numpy as jnp
+
+    from memrl.memory import insert_batch
+    from memrl.models import transition_embedding
+
+    embeddings = transition_embedding(observation_embedding, action, info["reward"], action_dim)
+    valid = jnp.asarray(info["elapsed_step"]) > 0
+    return insert_batch(memory, embeddings, episode_ids, timesteps, valid=valid)
+
+
 def _provenance() -> dict[str, Any]:
     dependencies = {}
     for name in ("envpool", "jax", "flax", "optax", "orbax-checkpoint", "numpy"):
@@ -55,11 +71,11 @@ def train(config: TrainConfig) -> Path:
     from flax import struct
     from flax.training.train_state import TrainState
 
-    from memrl.checkpointing import MemRLCheckpointManager, restore_checkpoint
+    from memrl.checkpointing import MEMORY_LAYOUT, MemRLCheckpointManager, restore_checkpoint
     from memrl.diagnostics import AGE_BIN_EDGES
     from memrl.envs import OBSERVATION_SHAPE, initial_episode_statistics, make_envpool, update_episode_statistics
     from memrl.logging import RunLogger
-    from memrl.memory import HostFrameRing, create_device_memory, insert_batch, sample_batch
+    from memrl.memory import HostFrameRing, create_device_memory, sample_batch
     from memrl.models import RetrievalAgent
 
     retrieval = config.retrieval_mode != "none"
@@ -113,6 +129,9 @@ def train(config: TrainConfig) -> Path:
         age_sum: jax.Array
         recent_count: jax.Array
         observation_norm_sum: jax.Array
+        action_norm_sum: jax.Array
+        reward_norm_sum: jax.Array
+        memory_observation_norm_sum: jax.Array
         context_norm_sum: jax.Array
         norm_ratio_sum: jax.Array
         age_histogram: jax.Array
@@ -123,6 +142,8 @@ def train(config: TrainConfig) -> Path:
         final_valid: jax.Array
         final_weights: jax.Array
         final_similarities: jax.Array
+        final_actions: jax.Array
+        final_rewards: jax.Array
 
     def empty_storage() -> RolloutStorage:
         prefix = (config.num_steps, config.num_envs)
@@ -167,6 +188,9 @@ def train(config: TrainConfig) -> Path:
             age_sum=jnp.asarray(0.0),
             recent_count=jnp.asarray(0, dtype=jnp.int32),
             observation_norm_sum=jnp.asarray(0.0),
+            action_norm_sum=jnp.asarray(0.0),
+            reward_norm_sum=jnp.asarray(0.0),
+            memory_observation_norm_sum=jnp.asarray(0.0),
             context_norm_sum=jnp.asarray(0.0),
             norm_ratio_sum=jnp.asarray(0.0),
             age_histogram=jnp.zeros((len(AGE_BIN_EDGES) - 1,), dtype=jnp.int32),
@@ -177,10 +201,13 @@ def train(config: TrainConfig) -> Path:
             final_valid=jnp.zeros(shape, dtype=jnp.bool_),
             final_weights=jnp.zeros(shape, dtype=jnp.float32),
             final_similarities=jnp.zeros(shape, dtype=jnp.float32),
+            final_actions=jnp.full(shape, -1, dtype=jnp.int32),
+            final_rewards=jnp.zeros(shape, dtype=jnp.float32),
         )
 
     envs = make_envpool(config.env_id, num_envs=config.num_envs, seed=config.seed)
     action_dim = int(envs.single_action_space.n)
+    config.resolve_memory_dim(action_dim)
     handle, _recv, _send, step_env = envs.xla()
     next_obs, _ = envs.reset()
     next_obs = jnp.asarray(next_obs)
@@ -224,7 +251,7 @@ def train(config: TrainConfig) -> Path:
                 statistics=statistics,
                 previous_episode_ids=jnp.where(completed, current.episode_ids, current.previous_episode_ids),
                 episode_ids=jnp.where(completed, new_ids, current.episode_ids),
-                timesteps=jnp.where(completed, 0, current.timesteps + 1),
+                timesteps=jnp.where(completed, 0, current.timesteps + (jnp.asarray(info["elapsed_step"]) > 0)),
                 next_episode_id=current.next_episode_id + completed.astype(jnp.int32).sum(),
             ),
             events,
@@ -279,6 +306,12 @@ def train(config: TrainConfig) -> Path:
             age_sum=summary.age_sum + jnp.sum(jnp.where(valid, ages, 0.0)),
             recent_count=summary.recent_count + (valid & (ages < 500)).astype(jnp.int32).sum(),
             observation_norm_sum=summary.observation_norm_sum + jnp.sum(jnp.where(env_valid, z_norm, 0.0)),
+            action_norm_sum=summary.action_norm_sum
+            + jnp.sum(jnp.where(valid, jnp.linalg.norm(sample.embeddings[..., 512:-1], axis=-1), 0.0)),
+            reward_norm_sum=summary.reward_norm_sum
+            + jnp.sum(jnp.where(valid, jnp.abs(sample.embeddings[..., -1]), 0.0)),
+            memory_observation_norm_sum=summary.memory_observation_norm_sum
+            + jnp.sum(jnp.where(valid, jnp.linalg.norm(sample.embeddings[..., :512], axis=-1), 0.0)),
             context_norm_sum=summary.context_norm_sum + jnp.sum(jnp.where(env_valid, context_norm, 0.0)),
             norm_ratio_sum=summary.norm_ratio_sum
             + jnp.sum(jnp.where(env_valid, context_norm / jnp.maximum(z_norm, 1e-8), 0.0)),
@@ -290,6 +323,8 @@ def train(config: TrainConfig) -> Path:
             final_valid=sample.valid,
             final_weights=output.retrieval.weights,
             final_similarities=output.retrieval.similarities,
+            final_actions=jnp.where(valid, jnp.argmax(sample.embeddings[..., 512:-1], axis=-1), -1),
+            final_rewards=sample.embeddings[..., -1],
         )
 
     @partial(jax.jit, donate_argnums=(4, 8))
@@ -317,12 +352,17 @@ def train(config: TrainConfig) -> Path:
                 values=storage.values.at[step].set(output.value[:, 0]),
             )
             summary = accumulate_summary(summary, output, sample, episodes, mem.total_insertions)
-            inserted = insert_batch(mem, output.memory_embedding, episodes.episode_ids, episodes.timesteps)
-            mem = inserted.state
             frame_batch = frame_batch.at[step].set(observation[:, -1])
-            frame_slots = frame_slots.at[step].set(inserted.physical_indices)
-            frame_insertions = frame_insertions.at[step].set(mem.insertion_ids[inserted.physical_indices])
             env_handle, (observation, reward, terminated, truncated, info) = step_env(env_handle, action)
+            inserted = record_transition(
+                mem, output.memory_embedding, action, info, episodes.episode_ids, episodes.timesteps, action_dim
+            )
+            mem = inserted.state
+            slots = inserted.physical_indices
+            frame_slots = frame_slots.at[step].set(slots)
+            frame_insertions = frame_insertions.at[step].set(
+                jnp.where(slots >= 0, mem.insertion_ids[jnp.maximum(slots, 0)], -1)
+            )
             episodes, events = advance_episodes(episodes, info, truncated)
             done = jnp.logical_or(terminated, truncated).astype(jnp.float32)
             storage = storage.replace(
@@ -648,6 +688,7 @@ def train(config: TrainConfig) -> Path:
             "config": config.to_dict(),
             "observation_shape": list(OBSERVATION_SHAPE),
             "action_dim": action_dim,
+            "memory_layout": MEMORY_LAYOUT if retrieval else "observation_v1",
             "provenance": provenance,
             "wandb_identity": {
                 "project": config.wandb_project,
@@ -819,6 +860,9 @@ def train(config: TrainConfig) -> Path:
                         "retrieval/recent_under_500_fraction": int(host_summary.recent_count) / candidates_n,
                         "representations/observation_embedding_norm": float(host_summary.observation_norm_sum) / env_n,
                         "representations/retrieved_memory_norm": float(host_summary.context_norm_sum) / env_n,
+                        "memory/observation_block_norm": float(host_summary.memory_observation_norm_sum) / candidates_n,
+                        "memory/action_block_norm": float(host_summary.action_norm_sum) / candidates_n,
+                        "memory/reward_block_norm": float(host_summary.reward_norm_sum) / candidates_n,
                         "representations/memory_to_observation_norm_ratio": float(host_summary.norm_ratio_sum) / env_n,
                         "retrieval/age_histogram": np.asarray(host_summary.age_histogram).astype(int).tolist(),
                         "retrieval/temperature": config.temperature,
@@ -861,6 +905,8 @@ def train(config: TrainConfig) -> Path:
                                     int(host_summary.final_timesteps[env_slot, position]),
                                     float(host_summary.final_weights[env_slot, position]),
                                     float(host_summary.final_similarities[env_slot, position]),
+                                    int(host_summary.final_actions[env_slot, position]),
+                                    float(host_summary.final_rewards[env_slot, position]),
                                     available,
                                     image,
                                 ]
@@ -877,6 +923,8 @@ def train(config: TrainConfig) -> Path:
                             "timestep",
                             "weight",
                             "similarity",
+                            "transition_action",
+                            "transition_reward_symlog",
                             "frame_available",
                             "frame",
                         ],
@@ -916,6 +964,8 @@ def train(config: TrainConfig) -> Path:
             "final_global_step": global_step,
             "batch_size": config.batch_size,
             "memory_capacity": config.memory_capacity,
+            "memory_dim": config.memory_dim,
+            "memory_layout": config.memory_layout,
             "finite": True,
             "oom": False,
             "cold_compilation_seconds": cold_compilation_seconds,

@@ -182,3 +182,71 @@ def test_random_retrieval_is_unweighted_mean() -> None:
     result = random_retrieval(candidates)
     np.testing.assert_allclose(np.asarray(result.context), [2.0, 4.0])
     np.testing.assert_allclose(np.asarray(result.weights), [0.5, 0.5])
+
+
+def test_masked_insert_compacts_rows_and_wraps_with_source_metadata() -> None:
+    state = _insert_range(create_device_memory(5, 2), 0, 4)
+    rows = jnp.asarray([[10, 110], [11, 111], [12, 112], [13, 113]], dtype=jnp.float32)
+    episodes = jnp.asarray([20, 21, 22, 23])
+    steps = jnp.asarray([30, 31, 32, 33])
+    result = jax.jit(insert_batch)(state, rows, episodes, steps, jnp.asarray([False, True, False, True]))
+    np.testing.assert_array_equal(result.physical_indices, [-1, 4, -1, 0])
+    assert int(result.state.size) == 5
+    assert int(result.state.next_index) == 1
+    assert int(result.state.total_insertions) == 6
+    np.testing.assert_array_equal(result.state.embeddings[jnp.asarray([4, 0])], rows[jnp.asarray([1, 3])])
+    np.testing.assert_array_equal(result.state.episode_ids, [23, 0, 0, 1, 21])
+    np.testing.assert_array_equal(result.state.timesteps, [33, 1, 2, 3, 31])
+    np.testing.assert_array_equal(result.state.insertion_ids, [5, 1, 2, 3, 4])
+
+
+def test_all_invalid_insert_leaves_empty_and_full_memory_unchanged() -> None:
+    for state in (create_device_memory(4, 2), _insert_range(create_device_memory(4, 2), 0, 4)):
+        result = jax.jit(insert_batch)(
+            state, jnp.ones((4, 2)), jnp.arange(4), jnp.arange(4), jnp.zeros(4, dtype=jnp.bool_)
+        )
+        np.testing.assert_array_equal(result.physical_indices, [-1, -1, -1, -1])
+        for before, after in zip(
+            jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(result.state), strict=True
+        ):
+            np.testing.assert_array_equal(before, after)
+
+
+def test_all_valid_mask_matches_unmasked_insert_and_stops_gradients() -> None:
+    state = _insert_range(create_device_memory(4, 2), 0, 3)
+    rows = jnp.ones((3, 2))
+    metadata = jnp.arange(3)
+    mask = jnp.ones(3, dtype=jnp.bool_)
+    masked = insert_batch(state, rows, metadata, metadata, mask)
+    unmasked = insert_batch(state, rows, metadata, metadata)
+    for actual, expected in zip(jax.tree_util.tree_leaves(masked), jax.tree_util.tree_leaves(unmasked), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    gradient = jax.grad(lambda values: insert_batch(state, values, metadata, metadata, mask).state.embeddings.sum())(
+        rows
+    )
+    np.testing.assert_array_equal(gradient, np.zeros((3, 2)))
+
+
+def test_masked_insert_compiles_without_callbacks_or_capacity_sized_compaction() -> None:
+    def lowered(capacity):
+        state = create_device_memory(capacity, 2)
+        rows, ids, mask = jnp.ones((3, 2)), jnp.arange(3), jnp.asarray([True, False, True])
+        traced = jax.make_jaxpr(insert_batch)(state, rows, ids, ids, mask)
+        hlo = jax.jit(insert_batch).lower(state, rows, ids, ids, mask).as_text()
+        assert "callback" not in hlo.lower()
+        assert "host" not in hlo.lower()
+        return _primitive_names(traced)
+
+    assert lowered(7) == lowered(100_003)
+
+
+def test_host_frame_ring_ignores_invalid_transition_rows_without_corruption() -> None:
+    ring = HostFrameRing.create(3, (2, 2))
+    ring.update(np.full((3, 2, 2), 7, dtype=np.uint8), [0, 1, 2], [0, 1, 2])
+    rows = np.stack([np.full((2, 2), value, dtype=np.uint8) for value in [90, 91, 92]])
+    ring.update(rows, [-1, 1, 0], [3, -1, 4])
+    np.testing.assert_array_equal(ring.frames[:, 0, 0], [92, 7, 7])
+    np.testing.assert_array_equal(ring.insertion_ids, [4, 1, 2])
+    np.testing.assert_array_equal(ring.available([-1, 1, 0], [3, -1, 4]), [False, False, True])
+    ring.update(rows, [-1, -1, -1], [-1, -1, -1])
+    np.testing.assert_array_equal(ring.frames[:, 0, 0], [92, 7, 7])

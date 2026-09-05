@@ -10,7 +10,8 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+MEMORY_LAYOUT = "transition_obs_action_symlog_v1"
 FORMAT_NAME = "memrl-orbax"
 
 
@@ -157,14 +158,27 @@ def restore_checkpoint(path: Path, training_abstract: Any | None = None) -> Chec
         metadata = dict(metadata_reader.restore(checkpoint_path / "metadata", args=ocp.args.JsonRestore()))
     finally:
         metadata_reader.close()
-    if metadata.get("schema_version") != SCHEMA_VERSION or metadata.get("format") != FORMAT_NAME:
+    schema = metadata.get("schema_version")
+    if schema not in {2, SCHEMA_VERSION} or metadata.get("format") != FORMAT_NAME:
         raise ValueError("unsupported MemRL checkpoint schema")
     saved_config = metadata.get("config", {})
-    if saved_config.get("retrieval_mode") in {"random", "learned"} and saved_config.get("memory_dim") != 512:
-        raise ValueError(
-            "incompatible retrieval checkpoint: expected memory_dim=512, "
-            f"got {saved_config.get('memory_dim')}; start a fresh run (no migration is provided)"
-        )
+    if saved_config.get("retrieval_mode") in {"random", "learned"}:
+        if schema != SCHEMA_VERSION or metadata.get("memory_layout") != MEMORY_LAYOUT:
+            raise ValueError(
+                "incompatible retrieval checkpoint: expected transition tuple memory layout; "
+                "start a fresh run (no migration is provided)"
+            )
+        action_dim = metadata.get("action_dim")
+        if type(action_dim) is not int or action_dim <= 0:
+            raise ValueError("incompatible retrieval checkpoint: action_dim must be a positive integer")
+        expected_dim = 512 + action_dim + 1
+        if saved_config.get("memory_dim") != expected_dim:
+            raise ValueError(
+                f"incompatible retrieval checkpoint: expected memory_dim={expected_dim}, "
+                f"got {saved_config.get('memory_dim')}; start a fresh run (no migration is provided)"
+            )
+    elif schema == 2 and saved_config.get("retrieval_mode") != "none":
+        raise ValueError("schema 2 compatibility is limited to none-mode baseline checkpoints")
     checkpointer = ocp.Checkpointer(_handler())
     try:
         restored = checkpointer.restore(

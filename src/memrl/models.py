@@ -23,8 +23,38 @@ VALID_RETRIEVAL_MODES = ("none", "random", "learned")
 def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     """Normalize the final axis without producing NaNs for zero vectors."""
 
-    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
-    return x / jnp.maximum(norm, eps)
+    squared_norm = jnp.sum(jnp.square(x), axis=-1, keepdims=True)
+    return x / jnp.sqrt(jnp.maximum(squared_norm, eps**2))
+
+
+def symlog(x: jax.Array) -> jax.Array:
+    """Compress raw reward magnitude while preserving its sign."""
+
+    x = jnp.asarray(x, dtype=jnp.float32)
+    return jnp.sign(x) * jnp.log1p(jnp.abs(x))
+
+
+def transition_embedding(
+    observation_embeddings: jax.Array,
+    actions: jax.Array,
+    raw_rewards: jax.Array,
+    action_dim: int,
+) -> jax.Array:
+    """Build detached (source observation, selected action, resulting reward) tuples."""
+
+    observation_embeddings = jnp.asarray(observation_embeddings, dtype=jnp.float32)
+    actions = jnp.asarray(actions)
+    raw_rewards = jnp.asarray(raw_rewards, dtype=jnp.float32)
+    if action_dim < 1:
+        raise ValueError("action_dim must be positive")
+    if observation_embeddings.ndim < 1 or observation_embeddings.shape[-1] != 512:
+        raise ValueError("observation embeddings must have final dimension 512")
+    if actions.shape != observation_embeddings.shape[:-1] or raw_rewards.shape != actions.shape:
+        raise ValueError("actions and raw rewards must match observation embedding batch dimensions")
+    values = jnp.concatenate(
+        (observation_embeddings, jax.nn.one_hot(actions, action_dim), symlog(raw_rewards)[..., None]), axis=-1
+    )
+    return jax.lax.stop_gradient(values)
 
 
 @struct.dataclass
@@ -184,7 +214,9 @@ class AtariEncoder(nn.Module):
 
 
 class QueryNetwork(nn.Module):
-    """512 -> GELU -> 512 query MLP with a 512-D input."""
+    """Observation-only query MLP with a configurable retrieval output width."""
+
+    output_dim: int = 512
 
     @nn.compact
     def __call__(self, z: jax.Array) -> jax.Array:
@@ -196,7 +228,7 @@ class QueryNetwork(nn.Module):
         )(z)
         x = nn.gelu(x, approximate=True)
         return nn.Dense(
-            512,
+            self.output_dim,
             kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="dense2",
@@ -238,7 +270,7 @@ class RetrievalAgent(nn.Module):
         if self.retrieval_mode not in VALID_RETRIEVAL_MODES:
             raise ValueError(f"unknown retrieval mode: {self.retrieval_mode!r}")
         self.encoder = AtariEncoder(name="encoder")
-        self.query_network = QueryNetwork(name="query")
+        self.query_network = QueryNetwork(output_dim=512 + self.action_dim + 1, name="query")
         self.actor = Actor(self.action_dim, name="actor")
         self.critic = Critic(name="critic")
 
@@ -261,9 +293,10 @@ class RetrievalAgent(nn.Module):
         if self.retrieval_mode == "none":
             raise ValueError("external context is only valid for a retrieval policy")
         z, h = self.encode(observations)
-        query = self.query_network(z) if self.retrieval_mode == "learned" else jnp.zeros_like(h)
-        if context.shape != z.shape:
-            raise ValueError(f"retrieval context must have shape {z.shape}; got {context.shape}")
+        context_shape = (z.shape[0], 512 + self.action_dim + 1)
+        query = self.query_network(z) if self.retrieval_mode == "learned" else jnp.zeros(context_shape, dtype=z.dtype)
+        if context.shape != context_shape:
+            raise ValueError(f"retrieval context must have shape {context_shape}; got {context.shape}")
         policy_input = jnp.concatenate((z, jax.lax.stop_gradient(context)), axis=-1)
         return self.actor(policy_input), self.critic(policy_input), query, h
 
@@ -310,7 +343,7 @@ class RetrievalAgent(nn.Module):
             if self.retrieval_mode == "random":
                 if self.is_initializing():
                     self.query_network(z)
-                query = jnp.zeros_like(h)
+                query = jnp.zeros((batch_size, 512 + self.action_dim + 1), dtype=z.dtype)
             else:
                 query = self.query_network(z)
             retrieval = retrieve_memories(

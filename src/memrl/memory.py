@@ -160,8 +160,13 @@ def insert_batch(
     embeddings: Array,
     episode_ids: Array,
     timesteps: Array,
+    valid: Array | None = None,
 ) -> MemoryInsertResult:
-    """Insert one row per environment in env-slot order."""
+    """Insert valid environment rows in env-slot order.
+
+    Invalid rows consume no FIFO slots and return physical index ``-1``.
+    Mask compaction touches only the environment batch, never the full FIFO.
+    """
 
     values = jnp.asarray(embeddings, dtype=jnp.float32)
     episodes = jnp.asarray(episode_ids, dtype=jnp.int32)
@@ -176,17 +181,29 @@ def insert_batch(
     if episodes.shape != (count,) or steps.shape != (count,):
         raise ValueError("episode_ids and timesteps must have shape [N]")
 
-    offsets = jnp.arange(count, dtype=jnp.int32)
-    physical = (state.next_index + offsets) % state.capacity
+    if valid is None:
+        offsets = jnp.arange(count, dtype=jnp.int32)
+        inserted_count = count
+        physical = (state.next_index + offsets) % state.capacity
+        write_indices = physical
+    else:
+        mask = jnp.asarray(valid, dtype=jnp.bool_)
+        if mask.shape != (count,):
+            raise ValueError("valid must have shape [N]")
+        offsets = jnp.cumsum(mask, dtype=jnp.int32) - 1
+        inserted_count = jnp.sum(mask, dtype=jnp.int32)
+        physical = jnp.where(mask, (state.next_index + offsets) % state.capacity, -1)
+        # Drop masked rows rather than writing a sentinel into a real FIFO slot.
+        write_indices = jnp.where(mask, physical, state.capacity)
     insertion_ids = state.total_insertions + offsets
     next_state = state.replace(
-        embeddings=state.embeddings.at[physical].set(jax.lax.stop_gradient(values)),
-        episode_ids=state.episode_ids.at[physical].set(episodes),
-        timesteps=state.timesteps.at[physical].set(steps),
-        insertion_ids=state.insertion_ids.at[physical].set(insertion_ids),
-        size=jnp.minimum(state.capacity, state.size + count),
-        next_index=(state.next_index + count) % state.capacity,
-        total_insertions=state.total_insertions + count,
+        embeddings=state.embeddings.at[write_indices].set(jax.lax.stop_gradient(values), mode="drop"),
+        episode_ids=state.episode_ids.at[write_indices].set(episodes, mode="drop"),
+        timesteps=state.timesteps.at[write_indices].set(steps, mode="drop"),
+        insertion_ids=state.insertion_ids.at[write_indices].set(insertion_ids, mode="drop"),
+        size=jnp.minimum(state.capacity, state.size + inserted_count),
+        next_index=(state.next_index + inserted_count) % state.capacity,
+        total_insertions=state.total_insertions + inserted_count,
     )
     return MemoryInsertResult(physical_indices=physical, state=next_state)
 
@@ -239,10 +256,12 @@ class HostFrameRing:
         count = frame_rows.shape[0]
         if slots.shape != (count,) or logical.shape != (count,):
             raise ValueError("physical_indices and insertion_ids must have shape [N]")
-        if np.any(slots < 0) or np.any(slots >= self.capacity):
+        if np.any(slots < -1) or np.any(slots >= self.capacity):
             raise IndexError("physical frame slot is outside ring capacity")
-        self.frames[slots] = frame_rows
-        self.insertion_ids[slots] = logical
+        keep = (slots >= 0) & (logical >= 0)
+        slots = slots[keep]
+        self.frames[slots] = frame_rows[keep]
+        self.insertion_ids[slots] = logical[keep]
         self.valid[slots] = True
 
     def invalidate_all(self) -> None:
@@ -261,6 +280,7 @@ class HostFrameRing:
         safe_slots = np.clip(slots, 0, self.capacity - 1)
         return (
             (slots >= 0)
+            & (logical >= 0)
             & (slots < self.capacity)
             & self.valid[safe_slots]
             & (self.insertion_ids[safe_slots] == logical)

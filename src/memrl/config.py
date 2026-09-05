@@ -30,7 +30,8 @@ class TrainConfig:
 
     retrieval_mode: Literal["none", "random", "learned"] = "none"
     memory_capacity: int = 100_000
-    memory_dim: int = 512
+    memory_dim: int | None = None
+    memory_layout: str = dataclasses.field(init=False, default="unresolved")
     retrieval_k: int = 64
     temperature: float = 0.1
     diagnostics_interval: int = 10
@@ -63,6 +64,24 @@ class TrainConfig:
     def num_iterations(self) -> int:
         return self.total_timesteps // self.batch_size
 
+    def resolve_memory_dim(self, action_dim: int) -> int:
+        """Resolve the environment-dependent tuple width before allocating state."""
+
+        if action_dim < 1:
+            raise ValueError("action_dim must be positive")
+        expected = (
+            (512 if self.memory_dim is None else self.memory_dim)
+            if self.retrieval_mode == "none"
+            else 512 + action_dim + 1
+        )
+        if expected < 1:
+            raise ValueError("memory dimension must be positive")
+        if self.memory_dim is not None and self.memory_dim != expected:
+            raise ValueError(f"{self.retrieval_mode} requires memory_dim={expected}; got {self.memory_dim}")
+        self.memory_dim = expected
+        self.memory_layout = "observation_v1" if self.retrieval_mode == "none" else "transition_obs_action_symlog_v1"
+        return expected
+
     def validate(self) -> None:
         if self.retrieval_mode not in {"none", "random", "learned"}:
             raise ValueError(f"Unknown retrieval mode: {self.retrieval_mode}")
@@ -74,10 +93,8 @@ class TrainConfig:
             raise ValueError("total_timesteps must be at least num_envs * num_steps")
         if self.batch_size % self.num_minibatches:
             raise ValueError("num_envs * num_steps must be divisible by num_minibatches")
-        if self.memory_capacity < 1 or self.memory_dim < 1 or self.retrieval_k < 1:
+        if self.memory_capacity < 1 or (self.memory_dim is not None and self.memory_dim < 1) or self.retrieval_k < 1:
             raise ValueError("memory capacity, dimension, and retrieval K must be positive")
-        if self.retrieval_mode != "none" and self.memory_dim != 512:
-            raise ValueError("retrieval requires memory_dim=512 (raw encoder features)")
         if self.retrieval_k > self.memory_capacity:
             raise ValueError("retrieval K cannot exceed memory capacity")
         if self.diagnostics_interval < 1 or self.diagnostics_top_k < 1:

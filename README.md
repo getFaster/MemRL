@@ -26,9 +26,11 @@ rewards and real game ends come from EnvPool info; PPO boundaries use episodic-l
 
 ## Architecture
 
-Retrieval modes carry a 100,000 x 512 JAX FIFO with embedding, episode, timestep, insertion, size, and write-index
-state. `none` does not allocate this state. Each environment samples K=64 candidates before the current eight
-embeddings are inserted. Warm-up sampling is uniform with replacement; once size reaches K, a vectorized fixed-work
+Retrieval modes carry a 100,000 x D JAX FIFO with embedding, episode, timestep, insertion, size, and write-index
+state. `none` does not allocate this state. Each environment samples K=64 candidates before choosing its action. After the environment step, valid
+transition tuples are inserted in environment-slot order. Terminal transitions are included; EnvPool auto-reset
+calls that discard the supplied action are skipped. Source observation frames and episode/timestep metadata
+stay aligned with their transitions. Warm-up sampling is uniform with replacement; once size reaches K, a vectorized fixed-work
 Floyd sampler draws a uniform subset without replacement. It never creates a memory-sized permutation or score
 vector.
 
@@ -37,11 +39,18 @@ All GELUs use the tanh approximation (`approximate=True`). Encoder layers and bo
 layers use unit-gain orthogonal initialization with zero biases; actor and critic output gains
 remain 0.01 and 1, respectively.
 
-Memory stores raw 512D encoder features with no deterministic projection. The query MLP takes
-512D input and applies Dense(512) -> GELU -> Dense(512); retrieval context is 512D. Both retrieval actor and
-critic take the concatenated 512D observation and 512D context (1024D total), while `none` keeps 512D inputs. Cosine normalization
-is used only for scoring. The float32 embedding FIFO alone occupies 204.8 MB at full capacity;
-candidate buffers require additional memory. Retrieval training requires `memory_dim=512`.
+Memory stores `[f(o_t), onehot(a_t), symlog(r_raw[t+1])]`, where `f` is the raw 512D encoder
+feature and `symlog(x) = sign(x) * log(1 + abs(x))`. The reward comes from EnvPool `info["reward"]`;
+PPO still uses clipped rewards. The width is `D = 512 + action_dim + 1`, resolved automatically from the
+environment; an explicit `memory_dim` must match. No component scales or deterministic projection are added.
+The observation-only query MLP applies Dense(512) -> GELU -> Dense(D). Full tuples participate in cosine
+scoring and context aggregation. Actor and critic take the 512D online observation concatenated with D-dimensional
+context; `none` keeps 512D inputs. The float32 FIFO occupies `100000 * D * 4` bytes at full capacity,
+plus candidate buffers. A transition's action and outcome cannot affect its own action selection.
+
+The encoder is fixed throughout each rollout and optimized during PPO. The next rollout uses the updated online
+encoder; a separate write-only encoder copied once after all PPO optimizer steps would be equivalent and is not
+allocated. Existing entries remain detached and unchanged across iterations, so encoder-version drift remains.
 
 Historical embeddings are detached. Candidate tensors are snapshotted in rollout storage and reused unchanged for
 all four PPO epochs. Random retrieval is a direct candidate mean: its query parameters exist for architectural
@@ -88,12 +97,13 @@ uv run memrl-train --retrieval-mode learned --seed 901 \
 
 Resume restores learning state but creates a fresh EnvPool handle. It assigns fresh episode IDs, resets active
 episode statistics, and records the unavoidable emulator-reset discontinuity. Legacy `.msgpack`/`.npz` checkpoints
-are left untouched and rejected; there is no migration path. Existing 256D retrieval checkpoints are
-also rejected for resume and evaluation before tensor restoration. Start fresh 512D retrieval runs in
-new output directories; existing baseline checkpoints remain architecturally compatible.
+are left untouched and rejected; there is no migration path. Schema 3 retrieval checkpoints require layout
+`transition_obs_action_symlog_v1`, a positive action count, and the matching resolved tuple width.
+Observation-only retrieval checkpoints (including schema 2, 256D, and 512D) are rejected before tensor restoration.
+Schema 2 `none` baseline checkpoints remain compatible. Start fresh tuple retrieval runs in new output directories.
 
-The 512D change requires fresh correctness validation. Learning quality and full-capacity throughput
-must be measured separately; prior 256D performance results do not validate the wider architecture.
+Tuple memory requires fresh correctness and performance validation. Its hypothesis is that historical actions and
+outcomes provide useful context; implementation checks and timing alone cannot establish learning quality.
 
 Evaluation accepts the one directory and freezes retrieval K/temperature from its training metadata:
 
@@ -102,7 +112,7 @@ uv run memrl-eval --checkpoint checkpoints/RUN/final --episodes 10
 ```
 
 Random evaluation samples uniformly. Learned evaluation scores the whole resident memory, samples K from the
-resulting distribution, and uses their unweighted mean.
+resulting distribution, and uses their unweighted mean. Evaluation uses the fixed saved tuple memory without insertion.
 
 ## Performance gate
 
@@ -117,6 +127,11 @@ Compilation and the first 100k steps are excluded from the steady-state median. 
 with `none` by seed, computes the median of three ratios, rejects missing/non-finite/OOM runs, and separately records
 cold compilation time plus peak device and host memory. A failed gate requires a full-memory JAX profile followed by
 correctness and performance reruns; it blocks all long jobs.
+
+For initial tuple validation, run three fresh sequential 200k-step processes at seed 901 (one per mode) using
+these benchmark settings. Report ratios against the same 2x/3x targets, compilation time, available peak memory,
+and finite/OOM status. These are preliminary results: the complete seeds 901-903 release gate remains required.
+No learning campaign or hyperparameter tuning is part of the tuple implementation validation.
 
 ## Concurrency and learning study
 
@@ -147,6 +162,8 @@ descriptive: no p-values, superiority/equivalence claims, null-effect claims, or
 
 Each run writes `metric_metadata.json`. Learned similarities/weights, entropy, effective count, temporal fractions,
 age summaries, and embedding/context norms are exact rollout reductions. Random query/similarity checks, policy
-interventions, representation checks, and final-batch encoder drift are periodic probes. Age counts use the fixed
+interventions, representation checks, and final-batch encoder drift are periodic probes. Encoder drift compares
+only observation coordinates. Observation/action/reward block norms and selected transition actions/rewards
+make component dominance inspectable. Age counts use the fixed
 edges `0, 10, 25, 50, 100, 250, 500, 1k, 2.5k, 5k, 10k, 25k, 50k, 75k, 100k`; top-memory tables use final-step
 candidates. `retrieval/recent_under_500_fraction` remains an exact scalar.

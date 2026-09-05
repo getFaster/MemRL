@@ -7,7 +7,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from memrl.models import AtariEncoder, QueryNetwork, RetrievalAgent, retrieve_memories
+from memrl.models import (
+    AtariEncoder,
+    QueryNetwork,
+    RetrievalAgent,
+    l2_normalize,
+    retrieve_memories,
+    symlog,
+    transition_embedding,
+)
 
 
 def _observations(batch_size: int = 2) -> jax.Array:
@@ -15,9 +23,9 @@ def _observations(batch_size: int = 2) -> jax.Array:
     return values.astype(jnp.uint8).reshape(batch_size, 4, 84, 84)
 
 
-def _candidates(batch_size: int = 2, count: int = 5) -> jax.Array:
-    values = jnp.arange(batch_size * count * 512, dtype=jnp.float32)
-    return jnp.sin(values / 31.0).reshape(batch_size, count, 512)
+def _candidates(batch_size: int = 2, count: int = 5, width: int = 512) -> jax.Array:
+    values = jnp.arange(batch_size * count * width, dtype=jnp.float32)
+    return jnp.sin(values / 31.0).reshape(batch_size, count, width)
 
 
 def test_retrieval_aggregation_and_metadata() -> None:
@@ -78,7 +86,7 @@ def test_random_retrieval_ignores_similarity_bias() -> None:
 def test_random_policy_logits_do_not_depend_on_query_parameters() -> None:
     agent = RetrievalAgent(action_dim=4, retrieval_mode="random")
     observations = _observations(batch_size=1)
-    candidates = _candidates(batch_size=1)
+    candidates = _candidates(batch_size=1, width=517)
     variables = agent.init(jax.random.PRNGKey(7), observations, candidates)
     baseline = agent.apply(variables, observations, candidates).logits
     perturbed = copy.deepcopy(variables)
@@ -90,10 +98,10 @@ def test_random_policy_logits_do_not_depend_on_query_parameters() -> None:
 def test_random_query_cosine_path_is_explicit_probe_only() -> None:
     agent = RetrievalAgent(action_dim=4, retrieval_mode="random")
     observations = _observations(batch_size=1)
-    candidates = _candidates(batch_size=1)
+    candidates = _candidates(batch_size=1, width=517)
     variables = agent.init(jax.random.PRNGKey(8), observations, candidates)
     output = agent.apply(variables, observations, candidates)
-    np.testing.assert_array_equal(output.query, jnp.zeros((1, 512)))
+    np.testing.assert_array_equal(output.query, jnp.zeros((1, 517)))
     np.testing.assert_array_equal(output.retrieval.similarities, jnp.zeros((1, 5)))
     query, similarities, _ = agent.apply(variables, observations, candidates, method=agent.retrieval_probe)
     assert jnp.linalg.norm(query) > 0
@@ -104,7 +112,7 @@ def test_random_query_cosine_path_is_explicit_probe_only() -> None:
 def test_agent_mode_switching_and_shapes(mode: str) -> None:
     agent = RetrievalAgent(action_dim=6, retrieval_mode=mode)
     observations = _observations()
-    candidates = _candidates() if mode != "none" else None
+    candidates = _candidates(width=519) if mode != "none" else None
     similarity_bias = jnp.zeros((2, 5), dtype=jnp.float32) if mode != "none" else None
     variables = agent.init(jax.random.PRNGKey(0), observations, candidates, similarity_bias=similarity_bias)
     output = agent.apply(variables, observations, candidates, similarity_bias=similarity_bias)
@@ -116,20 +124,20 @@ def test_agent_mode_switching_and_shapes(mode: str) -> None:
     assert output.observation_embedding.shape == (2, 512)
     assert output.memory_embedding.shape == (2, 512)
     np.testing.assert_array_equal(output.memory_embedding, output.observation_embedding)
-    assert output.query.shape == (2, 512)
-    expected_width = 512 if mode == "none" else 1024
+    assert output.query.shape == (2, 512 if mode == "none" else 519)
+    expected_width = 512 if mode == "none" else 1031
     for head in ("actor", "critic"):
         assert variables["params"][head]["output"]["kernel"].shape[0] == expected_width
-    assert output.retrieval.context.shape == (2, 512)
+    assert output.retrieval.context.shape == (2, 512 if mode == "none" else 519)
     if mode == "none":
         assert "query" not in variables["params"]
         assert output.retrieval.weights.shape == (2, 0)
     else:
         assert "query" in variables["params"]
         for layer in ("dense1", "dense2"):
-            assert variables["params"]["query"][layer]["kernel"].shape == (512, 512)
+            assert variables["params"]["query"][layer]["kernel"].shape == (512, 512 if layer == "dense1" else 519)
         assert output.retrieval.weights.shape == (2, 5)
-        assert variables["params"]["actor"]["output"]["kernel"].shape[0] == 1024
+        assert variables["params"]["actor"]["output"]["kernel"].shape[0] == 1031
 
 
 def test_encode_method_accepts_channels_last() -> None:
@@ -144,7 +152,7 @@ def test_encode_method_accepts_channels_last() -> None:
 def _query_gradient_norm(mode: str) -> float:
     agent = RetrievalAgent(action_dim=4, retrieval_mode=mode)
     observations = _observations(batch_size=1)
-    candidates = _candidates(batch_size=1)
+    candidates = _candidates(batch_size=1, width=517)
     variables = agent.init(jax.random.PRNGKey(2), observations, candidates)
 
     def loss(params):
@@ -178,7 +186,7 @@ def test_historical_candidate_embeddings_are_detached() -> None:
 def test_external_context_matches_policy_and_rejects_old_width(mode):
     agent = RetrievalAgent(action_dim=4, retrieval_mode=mode)
     observations = _observations(batch_size=1)
-    candidates = _candidates(batch_size=1)
+    candidates = _candidates(batch_size=1, width=517)
     variables = agent.init(jax.random.PRNGKey(9), observations, candidates)
     output = agent.apply(variables, observations, candidates)
     logits, value, query, h = agent.apply(
@@ -226,10 +234,37 @@ def test_query_uses_approximate_gelu_and_linear_output():
 
 def test_unit_orthogonal_initialization_preserves_head_gains():
     agent = RetrievalAgent(action_dim=6, retrieval_mode="learned")
-    params = agent.init(jax.random.PRNGKey(22), _observations(1), _candidates(1))["params"]
+    params = agent.init(jax.random.PRNGKey(22), _observations(1), _candidates(1, width=519))["params"]
     for module_name, layers in params.items():
         gain = 0.01 if module_name == "actor" else 1.0
         for layer in layers.values():
             kernel = np.asarray(layer["kernel"]).reshape(-1, layer["kernel"].shape[-1])
-            np.testing.assert_allclose(kernel.T @ kernel, gain**2 * np.eye(kernel.shape[1]), atol=2e-6)
+            np.testing.assert_allclose(
+                kernel.T @ kernel if kernel.shape[0] >= kernel.shape[1] else kernel @ kernel.T,
+                gain**2 * np.eye(min(kernel.shape)),
+                atol=2e-6,
+            )
             np.testing.assert_array_equal(layer["bias"], np.zeros_like(layer["bias"]))
+
+
+def test_transition_embedding_alignment_and_detachment():
+    features = jnp.arange(3 * 512, dtype=jnp.float32).reshape(3, 512)
+    actions = jnp.array([2, 0, 1])
+    rewards = jnp.array([-9.0, 0.0, 99.0])
+    result = jax.jit(lambda z, r: transition_embedding(z, actions, r, 3))(features, rewards)
+    np.testing.assert_array_equal(result[:, :512], features)
+    np.testing.assert_array_equal(result[:, 512:515], np.eye(3)[actions])
+    np.testing.assert_allclose(result[:, -1], [-np.log(10), 0, np.log(100)], rtol=1e-6)
+    gradients = jax.grad(lambda z, r: transition_embedding(z, actions, r, 3).sum(), argnums=(0, 1))(features, rewards)
+    for gradient in gradients:
+        np.testing.assert_array_equal(gradient, jnp.zeros_like(gradient))
+    np.testing.assert_array_equal(symlog(jnp.zeros(3)), jnp.zeros(3))
+
+
+def test_zero_query_normalization_has_finite_gradient():
+    query = jnp.zeros((1, 517))
+    candidates = _candidates(1, width=517)
+    gradient = jax.grad(lambda q: retrieve_memories(q, candidates, mode="learned").context.sum())(query)
+    assert np.isfinite(gradient).all()
+    assert jnp.linalg.norm(gradient) > 0
+    np.testing.assert_array_equal(l2_normalize(query), query)

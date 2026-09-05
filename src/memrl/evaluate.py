@@ -46,6 +46,9 @@ def evaluate(config: EvalConfig) -> dict[str, Any]:
     retrieval_k = int(train_config["retrieval_k"])
     temperature = float(train_config["temperature"])
     action_dim = int(bundle.metadata["action_dim"])
+    memory_dim = 512 if mode == "none" else 512 + action_dim + 1
+    if mode != "none" and train_config.get("memory_dim") != memory_dim:
+        raise ValueError(f"retrieval checkpoint requires transition memory width {memory_dim}")
     state_payload = bundle.training["state"]
     params = state_payload.params if hasattr(state_payload, "params") else state_payload["params"]
     agent = RetrievalAgent(action_dim=action_dim, retrieval_mode=mode, temperature=temperature)
@@ -87,7 +90,7 @@ def evaluate(config: EvalConfig) -> dict[str, Any]:
             output = agent.apply(params, observation, sample.embeddings)
             logits = output.logits
         else:
-            dummy = jnp.zeros((config.num_envs, retrieval_k, int(train_config["memory_dim"])), dtype=jnp.float32)
+            dummy = jnp.zeros((config.num_envs, retrieval_k, memory_dim), dtype=jnp.float32)
             preliminary = agent.apply(params, observation, dummy)
             retrieval_rng, sample_key = jax.random.split(retrieval_rng)
             retrieved = evaluation_retrieval(sample_key, preliminary.query, whole_memory, retrieval_k, temperature)
