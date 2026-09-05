@@ -1,121 +1,136 @@
-# MemRL: retrieval-augmented PPO on Atari Frostbite
+# MemRL: device-resident retrieval PPO on Frostbite
 
-A JAX/Flax implementation of the retrieval-memory experiment specified for
-Atari Frostbite. PPO structure, preprocessing, CNN and defaults follow
-CleanRL's `ppo_atari_envpool_xla_jax.py`; the pinned upstream source is in
-`vendor/` for comparison. The training environment uses Gymnasium so memory
-records and diagnostic frames can be maintained explicitly.
+MemRL compares `none`, `random`, and `learned` retrieval in a JAX/Flax PPO agent. Training and evaluation use
+EnvPool's Frostbite XLA backend exclusively. The rewrite preserves the experimental invariants while intentionally
+not preserving exact Gymnasium trajectories or old checkpoint compatibility.
+
+Do not start the 10M-step study until both the correctness and performance gates pass. The performance thresholds
+at full memory are median paired ratios `random / none <= 2.0` and `learned / none <= 3.0`.
 
 ## Setup
 
-Python and dependencies are managed entirely by [uv](https://docs.astral.sh/uv/):
+Python is pinned to 3.11. EnvPool 1.2.5 and Orbax 0.12.4 are direct locked dependencies.
 
 ```bash
-uv sync --extra dev                 # CPU development
-uv sync --extra dev --extra cuda12  # NVIDIA CUDA 12 (for Colab)
+uv sync --extra dev                 # CPU validation
+uv sync --extra dev --extra cuda12  # RTX/Colab validation
+uv run python -c "import envpool, jax; print(envpool.__version__, jax.__version__, jax.devices())"
 uv run pytest
+uv run ruff check src tests
 ```
 
-ALE's current wheels include Atari ROMs. Confirm the environment before a long
-run with `uv run python -c "import gymnasium as gym, ale_py; gym.register_envs(ale_py); print(gym.make('ALE/Frostbite-v5'))"`.
+The shared environment factory maps `FrostbiteNoFrameskip-v4`, `ALE/Frostbite-v5`, and related aliases to
+`Frostbite-v5`. It explicitly fixes eight per-environment seeds, four-frame skip and stack, 30 reset no-ops, FIRE
+reset, episodic life, reward clipping, 84x84 grayscale area resize, and zero sticky-action probability. Raw game
+rewards and real game ends come from EnvPool info; PPO boundaries use episodic-life termination.
 
-## Commands
+## Architecture
 
-The baseline has no retrieval parameters in its policy. Random and learned
-memory use the same 768-wide actor/critic input and differ only in aggregation.
-W&B is online by default; use `--wandb-mode disabled` for local tests.
+Retrieval modes carry a 100,000 x 256 JAX FIFO with embedding, episode, timestep, insertion, size, and write-index
+state. `none` does not allocate this state. Each environment samples K=64 candidates before the current eight
+embeddings are inserted. Warm-up sampling is uniform with replacement; once size reaches K, a vectorized fixed-work
+Floyd sampler draws a uniform subset without replacement. It never creates a memory-sized permutation or score
+vector.
+
+Historical embeddings are detached. Candidate tensors are snapshotted in rollout storage and reused unchanged for
+all four PPO epochs. Random retrieval is a direct candidate mean: its query parameters exist for architectural
+comparability, but ordinary inference executes neither the query MLP nor cosine scoring. Learned retrieval uses the
+query and cosine-softmax weighting.
+
+The full 128-step policy/EnvPool/memory rollout is one JIT call. GAE and all four epochs x four minibatches are a
+separate JIT call. The host observes one bundled result after rollout and one after PPO. Retrieval rollouts transfer
+their 1,024 grayscale frames in one host batch and update a NumPy frame ring using device-recorded physical slots.
+
+## Correctness gate
 
 ```bash
-# Mandatory all-mode smoke test (small debug budget)
+JAX_PLATFORMS=cpu uv run pytest
 uv run memrl-smoke --wandb-mode disabled
-
-# Three seeds per condition
-for mode in none random learned; do
-  for seed in 1 2 3; do
-    uv run memrl-train --retrieval-mode "$mode" --seed "$seed" \
-      --wandb-project memrl-frostbite
-  done
-done
-
-# Exact whole-memory retrieval evaluation from a checkpoint
-uv run memrl-eval --checkpoint checkpoints/RUN/final.msgpack \
-  --memory-checkpoint checkpoints/RUN/memory.npz
 ```
 
-Training writes the resolved configuration, JSONL metrics, parameter
-checkpoints, memory state and retrieval frame diagnostics under `runs/` and
-`checkpoints/`. W&B receives episodic return/length, SPS, PPO losses, explained
-variance and retrieval diagnostics at the environment-step axis.
+The unit suite covers ring insertion and wraparound, warm-up replacement, post-warm-up uniqueness and uniformity,
+deterministic PRNG replay, independent environment samples, capacity-independent sampler structure, no self
+retrieval, immutable snapshots, detached candidates, query and retrieval-score gradients, random fast-path
+independence, exact EnvPool configuration/accounting, diagnostics schemas, checkpoint round trips, analysis, and
+matrix gates. `memrl-smoke` runs real EnvPool in all modes and performs two compiled learned iterations.
 
-The diagnostics are grouped so failures can be localized:
+A release gate must additionally be run on the target RTX 2060: all-mode real smokes, trace/JAXPR inspection for no
+host callbacks in rollout or PPO loops, frame-full and frame-less recovery, and continuation from the latter.
 
-- PPO health: return, both losses, policy entropy, old/forward KL, clip
-  fraction, explained variance, raw gradient norm and SPS.
-- Retriever learning: entropy/effective count, similarity statistics, query
-  gradient norm, gradient with respect to scaled retrieval scores, and query
-  parameter change per optimizer step.
-- Policy use of memory: embedding norm ratio, policy KL and value change versus
-  zero memory, plus policy KL versus random and shuffled memory contexts.
-- Representation quality: random-pair cosine, dimension variance, pair distance,
-  near-duplicate rate, pre-normalization norms and stored/current encoder drift.
-- Temporal behavior: global retrieval age histogram, recent-memory fraction,
-  same-episode/previous-episode fractions and same-episode timestep distance.
+## Checkpoints and resume
 
-The five primary W&B plots are `charts/episodic_return`,
-`retrieval/entropy`, `gradients/query_network_norm`,
-`interventions/policy_kl_memory_vs_zero`, and
-`drift/stored_current_cosine_mean`.
+Orbax writes coherent checkpoint directories. Training state includes parameters, optimizer, device memory, every
+PRNG stream, counters, resolved configuration, dependency/Git provenance, W&B identity, and resume history.
+Diagnostic frames, per-slot insertion IDs, and validity are optional. Missing frames never invalidate learning
+state; `diagnostics/frame_coverage` reports occupied-slot coverage and memory tables mark unavailable images.
 
-## Method details
-
-Each current CNN feature `z` is projected without trainable parameters to the
-256-dimensional historical embedding `h`; NumPy copies enter a 100,000-step
-FIFO and cannot receive gradients. Rollouts store candidate embeddings, IDs,
-timesteps and indices. PPO reuses those exact candidates for every update epoch,
-so the old and new action probabilities have identical retrieval context.
-Learned mode uses a 512→256→256 query MLP and cosine-softmax weights at
-temperature 0.1. Random mode takes the candidate mean.
-
-During training candidates are sampled uniformly. Evaluation scores all stored
-embeddings, samples K indices from the resulting cosine-softmax distribution,
-and takes their unweighted mean as specified. The large raw frame ring is
-optional at checkpoint time; diagnostic top matches are emitted as compressed
-NPZ batches and W&B tables/images.
-
-`FrostbiteNoFrameskip-v4` is accepted as the experiment-facing name and mapped
-to the maintained `ALE/Frostbite-v5` registration when the legacy ID is absent.
-Both correspond to no built-in action repeat; the CleanRL max-skip wrapper
-performs the four-frame skip.
-
-## Colab
-
-Open `colab_memrl.ipynb`, select a GPU runtime, configure the repository path,
-and run the setup cell. It installs uv, syncs the CUDA extra, verifies JAX sees a
-GPU, logs into W&B, runs tests and exposes the three-condition launch cell.
-For persistent artifacts, set `--output-dir` and `--checkpoint-dir` to mounted
-Google Drive paths.
-
-## Local RTX 2060 guidance
-
-A 6 GB RTX 2060 should fit the default 8×128 rollout: the candidate snapshot is
-64 MiB, while the FIFO uses about 98 MiB for embeddings and 674 MiB for one
-diagnostic grayscale frame per entry in host RAM. JAX preallocation is disabled
-and its memory fraction defaults to 0.55. Run a 100k-step timing job before a
-full matrix and use the stabilized `charts/projected_hours_per_10m_steps`:
+Frames are checkpointed by default. Periodic checkpoints are written every 1,000 rollouts (1,024,000 environment
+steps), the newest two are retained, and `final/` is preserved. Async writes finish before rotation and process exit.
 
 ```bash
-uv sync --extra cuda12 --extra dev
-uv run python -c "import jax; print(jax.devices())"
+uv run memrl-train --retrieval-mode learned --seed 1
+uv run memrl-train --retrieval-mode learned --seed 1 \
+  --resume-from checkpoints/RUN/step_1024000
 uv run memrl-train --retrieval-mode learned --seed 901 \
-  --total-timesteps 100000 --wandb-project memrl-frostbite-validation
+  --no-save-memory-frames
 ```
 
-Do not infer throughput from the four-step smoke test because JAX compilation
-dominates it. Run the nine full jobs sequentially on this card.
+Resume restores learning state but creates a fresh EnvPool handle. It assigns fresh episode IDs, resets active
+episode statistics, and records the unavoidable emulator-reset discontinuity. Legacy `.msgpack`/`.npz` checkpoints
+are left untouched and rejected; there is no migration path.
 
-## Reproducibility boundary
+Evaluation accepts the one directory and freezes retrieval K/temperature from its training metadata:
 
-A successful smoke test verifies execution, gradients, mode switching and finite
-metrics. It is not a baseline reproduction or a Frostbite learning result. The
-requested experiment requires three complete seeds for each mode with the same
-budget, followed by curve aggregation and retrieval-frame review in W&B.
+```bash
+uv run memrl-eval --checkpoint checkpoints/RUN/final --episodes 10
+```
+
+Random evaluation samples uniformly. Learned evaluation scores the whole resident memory, samples K from the
+resulting distribution, and uses their unweighted mean.
+
+## Performance gate
+
+The benchmark launcher runs nine fresh 200k-step processes exclusively, seeds 901-903, in counterbalanced mode
+order. It disables W&B and checkpoints while retaining local metrics, normal diagnostics, and host-frame upkeep.
+
+```bash
+uv run memrl-benchmark --run-gate --output benchmark-report.json
+```
+
+Compilation and the first 100k steps are excluded from the steady-state median. The report pairs each retrieval mode
+with `none` by seed, computes the median of three ratios, rejects missing/non-finite/OOM runs, and separately records
+cold compilation time plus peak device and host memory. A failed gate requires a full-memory JAX profile followed by
+correctness and performance reruns; it blocks all long jobs.
+
+## Concurrency and learning study
+
+Campaign concurrency defaults to one. `--max-parallel 2` requires `--resource-report` from two concurrent learned
+canaries demonstrating full host frames, a frame-complete checkpoint, combined peak VRAM at most 4.8 GiB,
+`MemAvailable` at least 2 GiB, and swap growth at most 256 MiB. Timing matrices are always exclusive.
+
+```bash
+uv run memrl-matrix --max-parallel 1
+uv run memrl-matrix --max-parallel 2 --resource-report canary-resources.json
+```
+
+After every gate passes, run seeds 1-3 for all three modes at the frozen 10M-step budget. Every completed episode is
+written to `episodes.jsonl` with mode, seed, environment slot, completion step, raw return, and length.
+
+```bash
+uv run memrl-analyze \
+  --inputs runs/RUN_NONE_SEED1 runs/RUN_RANDOM_SEED1 runs/RUN_LEARNED_SEED1 \
+  --output analysis.json
+```
+
+Analysis builds the 101-point 0..10M grid from the latest up to 100 completed episodes, backfills leading empty grid
+points from the first populated point, and reports normalized trapezoidal AUC, final-window return, raw seed curves,
+and all three paired contrasts: learned-random, random-none, and learned-none. With three seeds the output is strictly
+descriptive: no p-values, superiority/equivalence claims, null-effect claims, or directional success label.
+
+## Metric fidelity
+
+Each run writes `metric_metadata.json`. Learned similarities/weights, entropy, effective count, temporal fractions,
+age summaries, and embedding/context norms are exact rollout reductions. Random query/similarity checks, policy
+interventions, representation checks, and final-batch encoder drift are periodic probes. Age counts use the fixed
+edges `0, 10, 25, 50, 100, 250, 500, 1k, 2.5k, 5k, 10k, 25k, 50k, 75k, 100k`; top-memory tables use final-step
+candidates. `retrieval/recent_under_500_fraction` remains an exact scalar.

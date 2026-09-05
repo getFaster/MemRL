@@ -112,10 +112,9 @@ def retrieve_memories(
     if query.ndim != 2:
         raise ValueError("query must have shape [B, D]")
     candidates = jax.lax.stop_gradient(_batched_candidates(query, candidate_embeddings))
-    diagnostic_query = query if mode == "learned" else jax.lax.stop_gradient(query)
-    similarities = jnp.einsum("bd,bkd->bk", l2_normalize(diagnostic_query), l2_normalize(candidates))
 
     if mode == "learned":
+        similarities = jnp.einsum("bd,bkd->bk", l2_normalize(query), l2_normalize(candidates))
         score_logits = similarities / temperature
         if similarity_bias is not None:
             similarity_bias = jnp.asarray(similarity_bias, dtype=score_logits.dtype)
@@ -124,6 +123,9 @@ def retrieve_memories(
             score_logits = score_logits + similarity_bias
         weights = jax.nn.softmax(score_logits, axis=-1)
     else:
+        # The random control is deliberately a direct mean.  Query and cosine
+        # work belongs to periodic probes, never ordinary policy inference.
+        similarities = jnp.zeros(candidates.shape[:-1], dtype=candidates.dtype)
         weights = jnp.full_like(similarities, 1.0 / candidates.shape[1])
 
     context = jnp.einsum("bk,bkd->bd", weights, candidates)
@@ -273,9 +275,22 @@ class RetrievalAgent(nn.Module):
         if self.retrieval_mode == "none":
             raise ValueError("external context is only valid for a retrieval policy")
         z, h = self.encode(observations)
-        query = self.query_network(z)
+        query = self.query_network(z) if self.retrieval_mode == "learned" else jnp.zeros_like(h)
         policy_input = jnp.concatenate((z, jax.lax.stop_gradient(context)), axis=-1)
         return self.actor(policy_input), self.critic(policy_input), query, h
+
+    def retrieval_probe(
+        self, observations: jax.Array, candidate_embeddings: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Run query/cosine diagnostics outside ordinary random inference."""
+
+        if self.retrieval_mode == "none":
+            raise ValueError("retrieval probes require a retrieval policy")
+        z, _ = self.encode(observations)
+        query = self.query_network(z)
+        candidates = jax.lax.stop_gradient(_batched_candidates(query, candidate_embeddings))
+        similarities = jnp.einsum("bd,bkd->bk", l2_normalize(query), l2_normalize(candidates))
+        return query, similarities, z
 
     def __call__(
         self,
@@ -302,9 +317,14 @@ class RetrievalAgent(nn.Module):
         else:
             if candidate_embeddings is None:
                 raise ValueError(f"{self.retrieval_mode} mode requires candidate embeddings")
-            # Instantiate the same query architecture in both retrieval modes.
-            # The random-mode retrieval boundary stops all dependence on it.
-            query = self.query_network(z)
+            # Random retains query parameters for architectural comparability,
+            # but its ordinary inference path does not execute the MLP.
+            if self.retrieval_mode == "random":
+                if self.is_initializing():
+                    self.query_network(z)
+                query = jnp.zeros_like(h)
+            else:
+                query = self.query_network(z)
             retrieval = retrieve_memories(
                 query,
                 candidate_embeddings,

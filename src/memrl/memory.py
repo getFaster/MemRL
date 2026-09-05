@@ -1,50 +1,276 @@
-"""Episodic memory storage and pure JAX retrieval operations.
+"""Device-resident episodic memory and retrieval operations.
 
-The storage class deliberately owns NumPy arrays.  This keeps historical
-embeddings outside the JAX computation graph; the retrieval functions also
-apply ``stop_gradient`` so callers cannot accidentally differentiate through a
-candidate array after converting it to a JAX array.
+Training memory is a pure JAX value. Sampling and insertion can therefore run
+inside the compiled rollout without copying embeddings or metadata through the
+host. Diagnostic frames deliberately live in a separate NumPy ring: they are
+optional evidence, not part of the state required to continue training.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import struct
 
 Array = jax.Array
 
 
-@dataclass(frozen=True)
-class MemorySample:
-    """A detached selection from :class:`EpisodicMemory`.
+@struct.dataclass
+class DeviceMemoryState:
+    """Immutable JAX FIFO state carried by the compiled rollout."""
 
-    ``physical_indices`` are ring-buffer slots. ``logical_indices`` are
-    monotonically increasing insertion IDs and therefore remain meaningful
-    after the ring wraps.
+    embeddings: Array
+    episode_ids: Array
+    timesteps: Array
+    insertion_ids: Array
+    size: Array
+    next_index: Array
+    total_insertions: Array
+
+    @property
+    def capacity(self) -> int:
+        return self.embeddings.shape[0]
+
+    @property
+    def memory_dim(self) -> int:
+        return self.embeddings.shape[1]
+
+
+class MemorySampleBatch(NamedTuple):
+    """Fixed-shape independent samples for all rollout environments."""
+
+    embeddings: Array
+    physical_indices: Array
+    insertion_ids: Array
+    episode_ids: Array
+    timesteps: Array
+    valid: Array
+    key: Array
+
+
+class MemoryInsertResult(NamedTuple):
+    """Physical write locations and the updated immutable memory state."""
+
+    physical_indices: Array
+    state: DeviceMemoryState
+
+
+def create_device_memory(capacity: int, dim: int) -> DeviceMemoryState:
+    """Allocate an empty device memory.
+
+    Callers must not invoke this function in ``none`` mode; absence of a state
+    is how that mode avoids the roughly 100 MiB embedding allocation.
     """
 
-    embeddings: np.ndarray
-    physical_indices: np.ndarray
-    logical_indices: np.ndarray
-    episode_ids: np.ndarray
-    timesteps: np.ndarray
-    frames: np.ndarray | None
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    if dim <= 0:
+        raise ValueError("dim must be positive")
+    return DeviceMemoryState(
+        embeddings=jnp.zeros((capacity, dim), dtype=jnp.float32),
+        episode_ids=jnp.full((capacity,), -1, dtype=jnp.int32),
+        timesteps=jnp.full((capacity,), -1, dtype=jnp.int32),
+        insertion_ids=jnp.full((capacity,), -1, dtype=jnp.int32),
+        size=jnp.asarray(0, dtype=jnp.int32),
+        next_index=jnp.asarray(0, dtype=jnp.int32),
+        total_insertions=jnp.asarray(0, dtype=jnp.int32),
+    )
 
-    def as_dict(self) -> dict[str, np.ndarray | None]:
-        return {
-            "embeddings": self.embeddings,
-            "physical_indices": self.physical_indices,
-            "logical_indices": self.logical_indices,
-            "episode_ids": self.episode_ids,
-            "timesteps": self.timesteps,
-            "frames": self.frames,
-        }
+
+def _floyd_offsets(key: Array, num_envs: int, k: int, size: Array) -> Array:
+    """Draw independent uniform K-subsets from ``range(size)``.
+
+    Floyd's algorithm needs exactly K draws and K slots per environment. Its
+    work and temporary storage are independent of memory capacity.
+    """
+
+    # Column i is uniform on [0, size - k + i], the Floyd range for that step.
+    upper_bounds = size - k + jnp.arange(k, dtype=jnp.int32) + 1
+    draws = jax.random.randint(key, (num_envs, k), 0, upper_bounds, dtype=jnp.int32)
+    selected = jnp.full((num_envs, k), -1, dtype=jnp.int32)
+
+    def add_one(i: int, values: Array) -> Array:
+        draw = draws[:, i]
+        collision = jnp.any(values == draw[:, None], axis=1)
+        replacement = size - k + i
+        chosen = jnp.where(collision, replacement, draw)
+        return values.at[:, i].set(chosen)
+
+    return jax.lax.fori_loop(0, k, add_one, selected)
+
+
+def sample_batch(state: DeviceMemoryState, key: Array, num_envs: int, k: int) -> MemorySampleBatch:
+    """Sample candidates independently for each environment.
+
+    For ``0 < size < k`` sampling is with replacement. At ``size >= k`` a
+    Floyd sampler produces a uniform subset without replacement. Empty memory
+    returns invalid zero candidates. The key advances in all cases so restore
+    and replay have one stable PRNG transition per rollout step.
+    """
+
+    if num_envs <= 0:
+        raise ValueError("num_envs must be positive")
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if k > state.capacity:
+        raise ValueError("k cannot exceed memory capacity")
+
+    next_key, sample_key = jax.random.split(key)
+    index_shape = (num_envs, k)
+
+    def empty(_: None) -> tuple[Array, Array]:
+        return jnp.zeros(index_shape, dtype=jnp.int32), jnp.zeros(index_shape, dtype=jnp.bool_)
+
+    def nonempty(_: None) -> tuple[Array, Array]:
+        def warmup(_: None) -> Array:
+            return jax.random.randint(sample_key, index_shape, 0, state.size, dtype=jnp.int32)
+
+        def full(_: None) -> Array:
+            return _floyd_offsets(sample_key, num_envs, k, state.size)
+
+        offsets = jax.lax.cond(state.size < k, warmup, full, operand=None)
+        oldest = jnp.where(state.size == state.capacity, state.next_index, 0)
+        physical = (oldest + offsets) % state.capacity
+        return physical, jnp.ones(index_shape, dtype=jnp.bool_)
+
+    physical, valid = jax.lax.cond(state.size == 0, empty, nonempty, operand=None)
+    # Slot zero is a safe gather for empty memory; validity marks it meaningless.
+    embeddings = jnp.where(valid[..., None], state.embeddings[physical], 0.0)
+    invalid_metadata = jnp.full(index_shape, -1, dtype=jnp.int32)
+    insertion_ids = jnp.where(valid, state.insertion_ids[physical], invalid_metadata)
+    episode_ids = jnp.where(valid, state.episode_ids[physical], invalid_metadata)
+    timesteps = jnp.where(valid, state.timesteps[physical], invalid_metadata)
+    return MemorySampleBatch(
+        embeddings=jax.lax.stop_gradient(embeddings),
+        physical_indices=jnp.where(valid, physical, invalid_metadata),
+        insertion_ids=insertion_ids,
+        episode_ids=episode_ids,
+        timesteps=timesteps,
+        valid=valid,
+        key=next_key,
+    )
+
+
+def insert_batch(
+    state: DeviceMemoryState,
+    embeddings: Array,
+    episode_ids: Array,
+    timesteps: Array,
+) -> MemoryInsertResult:
+    """Insert one row per environment in env-slot order."""
+
+    values = jnp.asarray(embeddings, dtype=jnp.float32)
+    episodes = jnp.asarray(episode_ids, dtype=jnp.int32)
+    steps = jnp.asarray(timesteps, dtype=jnp.int32)
+    if values.ndim != 2 or values.shape[1] != state.memory_dim:
+        raise ValueError(f"embeddings must have shape [N, {state.memory_dim}]")
+    count = values.shape[0]
+    if count <= 0:
+        raise ValueError("insert batch must not be empty")
+    if count > state.capacity:
+        raise ValueError("insert batch cannot exceed memory capacity")
+    if episodes.shape != (count,) or steps.shape != (count,):
+        raise ValueError("episode_ids and timesteps must have shape [N]")
+
+    offsets = jnp.arange(count, dtype=jnp.int32)
+    physical = (state.next_index + offsets) % state.capacity
+    insertion_ids = state.total_insertions + offsets
+    next_state = state.replace(
+        embeddings=state.embeddings.at[physical].set(jax.lax.stop_gradient(values)),
+        episode_ids=state.episode_ids.at[physical].set(episodes),
+        timesteps=state.timesteps.at[physical].set(steps),
+        insertion_ids=state.insertion_ids.at[physical].set(insertion_ids),
+        size=jnp.minimum(state.capacity, state.size + count),
+        next_index=(state.next_index + count) % state.capacity,
+        total_insertions=state.total_insertions + count,
+    )
+    return MemoryInsertResult(physical_indices=physical, state=next_state)
+
+
+@dataclass
+class HostFrameRing:
+    """Optional host-only diagnostic frames keyed by device-memory slots."""
+
+    frames: np.ndarray
+    insertion_ids: np.ndarray
+    valid: np.ndarray
+
+    @classmethod
+    def create(cls, capacity: int, frame_shape: tuple[int, ...]) -> HostFrameRing:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if not frame_shape or any(dimension <= 0 for dimension in frame_shape):
+            raise ValueError("frame_shape must contain positive dimensions")
+        return cls(
+            frames=np.zeros((capacity, *frame_shape), dtype=np.uint8),
+            insertion_ids=np.full((capacity,), -1, dtype=np.int64),
+            valid=np.zeros((capacity,), dtype=np.bool_),
+        )
+
+    @property
+    def capacity(self) -> int:
+        return self.frames.shape[0]
+
+    @property
+    def frame_shape(self) -> tuple[int, ...]:
+        return self.frames.shape[1:]
+
+    @property
+    def coverage(self) -> float:
+        return float(self.valid.mean())
+
+    def update(
+        self,
+        frames: np.ndarray | Array,
+        physical_indices: np.ndarray | Array,
+        insertion_ids: np.ndarray | Array,
+    ) -> None:
+        """Apply one host transfer worth of frames to recorded physical slots."""
+
+        frame_rows = np.asarray(frames, dtype=np.uint8)
+        slots = np.asarray(physical_indices, dtype=np.int64)
+        logical = np.asarray(insertion_ids, dtype=np.int64)
+        if frame_rows.ndim != self.frames.ndim or frame_rows.shape[1:] != self.frame_shape:
+            raise ValueError(f"frames must have shape [N, {', '.join(map(str, self.frame_shape))}]")
+        count = frame_rows.shape[0]
+        if slots.shape != (count,) or logical.shape != (count,):
+            raise ValueError("physical_indices and insertion_ids must have shape [N]")
+        if np.any(slots < 0) or np.any(slots >= self.capacity):
+            raise IndexError("physical frame slot is outside ring capacity")
+        self.frames[slots] = frame_rows
+        self.insertion_ids[slots] = logical
+        self.valid[slots] = True
+
+    def invalidate_all(self) -> None:
+        """Mark optional frames unavailable after a frame-less restore."""
+
+        self.valid.fill(False)
+        self.insertion_ids.fill(-1)
+
+    def available(self, physical_indices: np.ndarray | Array, insertion_ids: np.ndarray | Array) -> np.ndarray:
+        """Return whether slots still contain the requested logical memories."""
+
+        slots = np.asarray(physical_indices, dtype=np.int64)
+        logical = np.asarray(insertion_ids, dtype=np.int64)
+        if slots.shape != logical.shape:
+            raise ValueError("physical_indices and insertion_ids must have matching shapes")
+        safe_slots = np.clip(slots, 0, self.capacity - 1)
+        return (
+            (slots >= 0)
+            & (slots < self.capacity)
+            & self.valid[safe_slots]
+            & (self.insertion_ids[safe_slots] == logical)
+        )
+
+    def coverage_for(self, physical_indices: np.ndarray | Array, insertion_ids: np.ndarray | Array) -> float:
+        """Return exact frame coverage for a set of currently resident memories."""
+
+        availability = self.available(physical_indices, insertion_ids)
+        return float(availability.mean()) if availability.size else 1.0
 
 
 class RetrievalResult(NamedTuple):
@@ -58,290 +284,6 @@ class EvaluationRetrievalResult(NamedTuple):
     probabilities: Array
     similarities: Array
     sampled_indices: Array
-
-
-class EpisodicMemory:
-    """Fixed-capacity FIFO ring buffer for detached per-step memories."""
-
-    def __init__(
-        self,
-        capacity: int,
-        memory_dim: int,
-        observation_shape: Sequence[int] | None = None,
-        *,
-        frame_shape: Sequence[int] | None = None,
-        seed: int = 0,
-    ) -> None:
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        if memory_dim <= 0:
-            raise ValueError("memory_dim must be positive")
-        if observation_shape is not None and frame_shape is not None:
-            if tuple(observation_shape) != tuple(frame_shape):
-                raise ValueError("observation_shape and frame_shape disagree")
-
-        shape = observation_shape if observation_shape is not None else frame_shape
-        self.capacity = int(capacity)
-        self.memory_dim = int(memory_dim)
-        self.observation_shape = tuple(int(x) for x in shape) if shape is not None else None
-        if self.observation_shape is not None and any(x <= 0 for x in self.observation_shape):
-            raise ValueError("observation dimensions must be positive")
-
-        self.embeddings = np.empty((self.capacity, self.memory_dim), dtype=np.float32)
-        self.episode_ids = np.empty(self.capacity, dtype=np.int64)
-        self.timesteps = np.empty(self.capacity, dtype=np.int64)
-        self.insertion_ids = np.empty(self.capacity, dtype=np.int64)
-        self.frames = (
-            np.empty((self.capacity, *self.observation_shape), dtype=np.uint8)
-            if self.observation_shape is not None
-            else None
-        )
-        self._size = 0
-        self._next_index = 0
-        self._total_added = 0
-        self._rng = np.random.default_rng(seed)
-
-    def __len__(self) -> int:
-        return self._size
-
-    @property
-    def size(self) -> int:
-        return self._size
-
-    @property
-    def next_index(self) -> int:
-        """Physical slot that the next insertion will overwrite."""
-
-        return self._next_index
-
-    @property
-    def total_added(self) -> int:
-        return self._total_added
-
-    def clear(self) -> None:
-        self._size = 0
-        self._next_index = 0
-        self._total_added = 0
-
-    def add(
-        self,
-        embedding: np.ndarray | Array,
-        episode_id: int | np.ndarray,
-        timestep: int | np.ndarray,
-        frame: np.ndarray | Array | None = None,
-    ) -> np.ndarray | np.int64:
-        """Append one step or a batch of steps and return their insertion IDs.
-
-        Inputs are copied to fixed NumPy dtypes. A batch must have a single
-        leading dimension, with corresponding episode/timestep/frame rows.
-        """
-
-        values = np.asarray(embedding, dtype=np.float32)
-        scalar = values.ndim == 1
-        if scalar:
-            values = values[None, :]
-        if values.ndim != 2 or values.shape[1] != self.memory_dim:
-            raise ValueError(
-                f"embedding must have shape ({self.memory_dim},) or (N, {self.memory_dim}); got {values.shape}"
-            )
-        count = values.shape[0]
-        episodes = self._metadata_rows(episode_id, count, "episode_id")
-        steps = self._metadata_rows(timestep, count, "timestep")
-        frame_rows = self._frame_rows(frame, count)
-        logical = np.arange(self._total_added, self._total_added + count, dtype=np.int64)
-
-        # If the batch itself exceeds capacity, only its newest portion can be
-        # resident. Account for every insertion while writing the retained tail
-        # in chronological order.
-        if count >= self.capacity:
-            keep = slice(count - self.capacity, count)
-            physical = (self._next_index + np.arange(count, dtype=np.int64)) % self.capacity
-            physical = physical[keep]
-            self.embeddings[physical] = values[keep]
-            self.episode_ids[physical] = episodes[keep]
-            self.timesteps[physical] = steps[keep]
-            self.insertion_ids[physical] = logical[keep]
-            if self.frames is not None:
-                assert frame_rows is not None
-                self.frames[physical] = frame_rows[keep]
-            self._size = self.capacity
-            self._next_index = int((self._next_index + count) % self.capacity)
-        else:
-            physical = (self._next_index + np.arange(count)) % self.capacity
-            self.embeddings[physical] = values
-            self.episode_ids[physical] = episodes
-            self.timesteps[physical] = steps
-            self.insertion_ids[physical] = logical
-            if self.frames is not None:
-                assert frame_rows is not None
-                self.frames[physical] = frame_rows
-            self._next_index = int((self._next_index + count) % self.capacity)
-            self._size = min(self.capacity, self._size + count)
-
-        self._total_added += count
-        return logical[0] if scalar else logical
-
-    # A familiar replay-buffer spelling, useful at call sites.
-    append = add
-
-    def sample_candidates(
-        self,
-        count: int,
-        *,
-        rng: np.random.Generator | int | None = None,
-        replace: bool | None = None,
-        include_frames: bool = False,
-    ) -> MemorySample:
-        """Uniformly sample candidates from the resident memory.
-
-        Sampling automatically uses replacement during memory warm-up so the
-        returned candidate dimension remains fixed.
-        """
-
-        if count <= 0:
-            raise ValueError("count must be positive")
-        if not self._size:
-            raise ValueError("cannot sample an empty memory")
-        generator = (
-            self._rng if rng is None else (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng))
-        )
-        use_replacement = self._size < count if replace is None else replace
-        if not use_replacement and count > self._size:
-            raise ValueError("cannot sample more resident memories without replacement")
-        resident_offset = generator.choice(self._size, size=count, replace=use_replacement)
-        physical = self.chronological_physical_indices()[resident_offset]
-        return self._selection(physical, include_frames=include_frames)
-
-    sample = sample_candidates
-
-    def all(self, *, include_frames: bool = False) -> MemorySample:
-        """Return all resident entries, oldest to newest."""
-
-        return self._selection(self.chronological_physical_indices(), include_frames=include_frames)
-
-    get_all = all
-
-    def get_by_physical_indices(
-        self, physical_indices: np.ndarray | Sequence[int], *, include_frames: bool = True
-    ) -> MemorySample:
-        """Fetch selected ring slots for periodic retrieval diagnostics."""
-
-        physical = np.asarray(physical_indices, dtype=np.int64)
-        if physical.ndim != 1:
-            raise ValueError("physical_indices must be one-dimensional")
-        if np.any(physical < 0) or np.any(physical >= self.capacity):
-            raise IndexError("physical index is outside memory capacity")
-        resident = self.chronological_physical_indices()
-        if not np.all(np.isin(physical, resident)):
-            raise IndexError("physical index does not refer to a resident memory")
-        return self._selection(physical, include_frames=include_frames)
-
-    def chronological_physical_indices(self) -> np.ndarray:
-        if self._size == 0:
-            return np.empty(0, dtype=np.int64)
-        oldest = self._next_index if self._size == self.capacity else 0
-        return (oldest + np.arange(self._size, dtype=np.int64)) % self.capacity
-
-    def _selection(self, physical: np.ndarray, *, include_frames: bool) -> MemorySample:
-        physical = np.asarray(physical, dtype=np.int64)
-        return MemorySample(
-            embeddings=self.embeddings[physical].copy(),
-            physical_indices=physical.copy(),
-            logical_indices=self.insertion_ids[physical].copy(),
-            episode_ids=self.episode_ids[physical].copy(),
-            timesteps=self.timesteps[physical].copy(),
-            frames=(self.frames[physical].copy() if include_frames and self.frames is not None else None),
-        )
-
-    @staticmethod
-    def _metadata_rows(value: int | np.ndarray, count: int, name: str) -> np.ndarray:
-        array = np.asarray(value, dtype=np.int64)
-        if array.ndim == 0:
-            return np.full(count, array.item(), dtype=np.int64)
-        if array.shape != (count,):
-            raise ValueError(f"{name} must be scalar or shape ({count},); got {array.shape}")
-        return array.copy()
-
-    def _frame_rows(self, frame: np.ndarray | Array | None, count: int) -> np.ndarray | None:
-        if self.frames is None:
-            if frame is not None:
-                raise ValueError("frame supplied to a memory configured without observation_shape")
-            return None
-        if frame is None:
-            raise ValueError("frame is required when observation_shape is configured")
-        array = np.asarray(frame, dtype=np.uint8)
-        expected_single = self.observation_shape
-        expected_batch = (count, *self.observation_shape)
-        if count == 1 and array.shape == expected_single:
-            return array[None, ...].copy()
-        if array.shape != expected_batch:
-            raise ValueError(f"frame must have shape {expected_single} or {expected_batch}; got {array.shape}")
-        return array.copy()
-
-    @staticmethod
-    def _checkpoint_paths(path: str | Path) -> tuple[Path, Path]:
-        path = Path(path)
-        if path.suffix == ".npz":
-            path.parent.mkdir(parents=True, exist_ok=True)
-            return path, path.with_name(f"{path.stem}.frames.npy")
-        path.mkdir(parents=True, exist_ok=True)
-        return path / "memory.npz", path / "frames.npy"
-
-    def save(self, path: str | Path, *, include_frames: bool = True) -> None:
-        """Save occupied ring slots; frames use a separate uncompressed NPY."""
-
-        metadata_path, frames_path = self._checkpoint_paths(path)
-        occupied = self.chronological_physical_indices()
-        np.savez_compressed(
-            metadata_path,
-            capacity=np.asarray(self.capacity, dtype=np.int64),
-            memory_dim=np.asarray(self.memory_dim, dtype=np.int64),
-            observation_shape=np.asarray(self.observation_shape or (), dtype=np.int64),
-            size=np.asarray(self._size, dtype=np.int64),
-            next_index=np.asarray(self._next_index, dtype=np.int64),
-            total_added=np.asarray(self._total_added, dtype=np.int64),
-            physical_indices=occupied,
-            embeddings=self.embeddings[occupied],
-            episode_ids=self.episode_ids[occupied],
-            timesteps=self.timesteps[occupied],
-            insertion_ids=self.insertion_ids[occupied],
-            frames_saved=np.asarray(bool(include_frames and self.frames is not None)),
-        )
-        if include_frames and self.frames is not None:
-            np.save(frames_path, self.frames[occupied], allow_pickle=False)
-
-    save_checkpoint = save
-
-    @classmethod
-    def load(cls, path: str | Path, *, seed: int = 0) -> EpisodicMemory:
-        metadata_path, frames_path = cls._checkpoint_paths(path)
-        with np.load(metadata_path, allow_pickle=False) as data:
-            observation_shape = tuple(int(x) for x in data["observation_shape"])
-            memory = cls(
-                capacity=int(data["capacity"]),
-                memory_dim=int(data["memory_dim"]),
-                observation_shape=observation_shape or None,
-                seed=seed,
-            )
-            physical = data["physical_indices"].astype(np.int64, copy=False)
-            memory.embeddings[physical] = data["embeddings"]
-            memory.episode_ids[physical] = data["episode_ids"]
-            memory.timesteps[physical] = data["timesteps"]
-            memory.insertion_ids[physical] = data["insertion_ids"]
-            memory._size = int(data["size"])
-            memory._next_index = int(data["next_index"])
-            memory._total_added = int(data["total_added"])
-            frames_saved = bool(data["frames_saved"])
-        if frames_saved:
-            if not frames_path.exists():
-                raise FileNotFoundError(f"frame checkpoint is missing: {frames_path}")
-            assert memory.frames is not None
-            memory.frames[physical] = np.load(frames_path, allow_pickle=False)
-        elif memory.frames is not None and physical.size:
-            memory.frames[physical] = 0
-        return memory
-
-    load_checkpoint = load
 
 
 def l2_normalize(x: Array, axis: int = -1, eps: float = 1e-8) -> Array:
@@ -369,11 +311,7 @@ def cosine_similarities(query: Array, candidates: Array) -> Array:
     return jnp.einsum("...d,...kd->...k", query, candidates)
 
 
-def learned_retrieval(
-    query: Array,
-    candidates: Array,
-    temperature: float = 0.1,
-) -> RetrievalResult:
+def learned_retrieval(query: Array, candidates: Array, temperature: float = 0.1) -> RetrievalResult:
     """Softmax-weighted retrieval with gradients only through the query."""
 
     if temperature <= 0:
@@ -406,12 +344,7 @@ def random_retrieval(candidates: Array) -> RetrievalResult:
     return RetrievalResult(jnp.mean(historical, axis=-2), weights, similarities)
 
 
-def retrieve(
-    mode: str,
-    query: Array,
-    candidates: Array,
-    temperature: float = 0.1,
-) -> RetrievalResult:
+def retrieve(mode: str, query: Array, candidates: Array, temperature: float = 0.1) -> RetrievalResult:
     """Dispatch the three experiment modes with a fixed context shape."""
 
     if mode == "learned":
@@ -434,12 +367,7 @@ def evaluation_retrieval(
     count: int,
     temperature: float = 0.1,
 ) -> EvaluationRetrievalResult:
-    """Score the whole memory, sample indices, then average sampled values.
-
-    This implements final evaluation retrieval without candidate subsampling.
-    Batched queries and memories are supported; their leading dimensions must
-    match. Sampling is with replacement, as specified by categorical draws.
-    """
+    """Score the whole memory, sample K indices, then average sampled values."""
 
     if count <= 0:
         raise ValueError("count must be positive")
@@ -450,7 +378,6 @@ def evaluation_retrieval(
         raise ValueError("at least one memory is required")
     similarities = cosine_similarities(query, historical)
     probabilities = jax.nn.softmax(similarities / temperature, axis=-1)
-
     flat_probabilities = probabilities.reshape((-1, probabilities.shape[-1]))
     keys = jax.random.split(key, flat_probabilities.shape[0])
 

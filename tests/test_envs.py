@@ -2,143 +2,176 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import gymnasium as gym
+import jax
 import numpy as np
+import pytest
 
 from memrl.envs import (
-    ChannelFirstObservation,
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-    WarpFrame,
-    episode_end_mask,
-    extract_final_episode_stats,
-    make_env,
+    OBSERVATION_SHAPE,
+    envpool_config,
+    initial_episode_statistics,
+    make_envpool,
+    normalize_env_id,
+    update_episode_statistics,
+    validate_envpool_contract,
+    validate_envpool_step,
 )
 
 
-class MockAtari(gym.Env):
-    metadata = {"render_modes": []}
+class FakeEnvPool:
+    def __init__(self, observation_shape=OBSERVATION_SHAPE, action_count=4) -> None:
+        self.action_space = SimpleNamespace(n=action_count)
+        self.observation_space = SimpleNamespace(shape=observation_shape)
 
-    def __init__(self) -> None:
-        self.observation_space = gym.spaces.Box(0, 255, (210, 160, 3), dtype=np.uint8)
-        self.action_space = gym.spaces.Discrete(4)
-        self.ale = SimpleNamespace(lives=lambda: self._lives)
-        self._lives = 3
-        self.steps = 0
-
-    def get_action_meanings(self):
-        return ["NOOP", "FIRE", "UP", "DOWN"]
-
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
-        self._lives = 3
-        self.steps = 0
-        return np.zeros(self.observation_space.shape, dtype=np.uint8), {}
-
-    def step(self, action):
-        self.steps += 1
-        frame = np.full(self.observation_space.shape, self.steps, dtype=np.uint8)
-        return frame, 2.5, False, False, {}
+    def xla(self):
+        return object(), object(), object(), object()
 
 
-def test_cleanrl_gameplay_wrappers_without_rom():
-    env = MockAtari()
-    env = NoopResetEnv(env, noop_max=1)
-    env.override_num_noops = 1
-    env = MaxAndSkipEnv(env, skip=4)
-    env = EpisodicLifeEnv(env)
-    env = FireResetEnv(env)
-    env = ClipRewardEnv(env)
-
-    observation, _ = env.reset(seed=7)
-    observation, reward, terminated, truncated, _ = env.step(3)
-    assert observation.shape == (210, 160, 3)
-    assert reward == 1.0
-    assert not terminated and not truncated
+def test_frostbite_aliases_normalize_to_envpool_task():
+    for alias in (
+        "Frostbite-v5",
+        "ALE/Frostbite-v5",
+        "FrostbiteNoFrameskip-v4",
+        "ALE/FrostbiteNoFrameskip-v4",
+    ):
+        assert normalize_env_id(alias) == "Frostbite-v5"
+    assert normalize_env_id("Pong-v5") == "Pong-v5"
 
 
-def test_channel_first_accepts_channel_last_stack():
-    env = MockAtari()
-    env.observation_space = gym.spaces.Box(0, 255, (84, 84, 4), dtype=np.uint8)
-    wrapped = ChannelFirstObservation(env)
-    result = wrapped.observation(np.zeros((84, 84, 4), dtype=np.uint8))
-    assert result.shape == (4, 84, 84)
-    assert wrapped.observation_space.shape == (4, 84, 84)
-
-
-def test_full_preprocessing_has_channel_first_shape(monkeypatch):
-    monkeypatch.setattr("memrl.envs._make_atari", lambda env_id, render_mode: MockAtari())
-    env = make_env("ALE/Frostbite-v5", seed=3, idx=0, capture_video=False, run_name="test")()
-    observation, _ = env.reset(seed=3)
-    assert observation.shape == (4, 84, 84)
-    assert observation.dtype == np.uint8
-    observation, reward, *_ = env.step(0)
-    assert observation.shape == (4, 84, 84)
-    assert reward == 1.0
-
-
-def test_warp_frame_preserves_constant_luma():
-    env = WarpFrame(MockAtari())
-    rgb = np.empty((210, 160, 3), dtype=np.uint8)
-    rgb[...] = (100, 150, 200)
-    observation = env.observation(rgb)
-    assert observation.shape == (84, 84)
-    assert np.unique(observation).tolist() == [141]
-
-
-def test_extract_episode_stats_from_vector_final_info():
-    infos = {
-        "final_info": np.asarray(
-            [{"episode": {"r": np.asarray(42.5), "l": np.asarray(123), "t": np.asarray(1.5)}}, None],
-            dtype=object,
-        ),
-        "_final_info": np.asarray([True, False]),
+def test_locked_envpool_configuration_is_explicit():
+    config = envpool_config("ALE/Frostbite-v5", num_envs=3, seed=11)
+    assert config == {
+        "task_id": "Frostbite-v5",
+        "env_type": "gym",
+        "num_envs": 3,
+        "batch_size": 3,
+        "seed": [11, 12, 13],
+        "frame_skip": 4,
+        "stack_num": 4,
+        "noop_max": 30,
+        "use_fire_reset": True,
+        "reward_clip": True,
+        "episodic_life": True,
+        "img_height": 84,
+        "img_width": 84,
+        "gray_scale": True,
+        "use_inter_area_resize": True,
+        "repeat_action_probability": 0.0,
     }
-    assert extract_final_episode_stats(infos) == [{"return": 42.5, "length": 123, "time": 1.5}]
 
 
-def test_extract_episode_stats_from_masked_vector_episode():
-    infos = {
-        "episode": {
-            "r": np.asarray([10.0, 20.0]),
-            "l": np.asarray([5, 8]),
-            "t": np.asarray([0.1, 0.2]),
+def test_explicit_seed_sequence_must_match_num_envs():
+    assert envpool_config("Frostbite-v5", num_envs=2, seed=[101, 303])["seed"] == [101, 303]
+    with pytest.raises(ValueError, match="exactly 2"):
+        envpool_config("Frostbite-v5", num_envs=2, seed=[101])
+
+
+def test_make_envpool_calls_native_factory_and_adds_vector_contract(monkeypatch):
+    captured = {}
+    fake_env = FakeEnvPool()
+
+    def fake_make(task_id, **kwargs):
+        captured.update(task_id=task_id, **kwargs)
+        return fake_env
+
+    monkeypatch.setattr("memrl.envs.import_module", lambda name: SimpleNamespace(make=fake_make))
+    result = make_envpool("FrostbiteNoFrameskip-v4", num_envs=2, seed=7)
+
+    assert result is fake_env
+    assert captured["task_id"] == "Frostbite-v5"
+    assert captured["seed"] == [7, 8]
+    assert captured["env_type"] == "gym"
+    assert fake_env.num_envs == 2
+    assert fake_env.single_action_space is fake_env.action_space
+    assert fake_env.single_observation_space is fake_env.observation_space
+    assert fake_env.is_vector_env is True
+
+
+def test_validate_envpool_contract_rejects_wrong_observations():
+    env = FakeEnvPool(observation_shape=(84, 84, 4))
+    env.num_envs = 2
+    env.single_action_space = env.action_space
+    env.single_observation_space = env.observation_space
+    with pytest.raises(ValueError, match="expected EnvPool observations"):
+        validate_envpool_contract(env, num_envs=2)
+
+
+def test_validate_step_requires_raw_reward_and_real_game_boundaries():
+    observation = np.zeros((2, *OBSERVATION_SHAPE), dtype=np.uint8)
+    reward = np.asarray([1.0, -1.0], dtype=np.float32)
+    terminated = np.asarray([False, True])
+    truncated = np.asarray([False, False])
+    info = {
+        "reward": np.asarray([5.0, -3.0], dtype=np.float32),
+        "terminated": np.asarray([False, False]),
+    }
+    validate_envpool_step(observation, reward, terminated, truncated, info, num_envs=2)
+    with pytest.raises(KeyError, match="reward"):
+        validate_envpool_step(
+            observation,
+            reward,
+            terminated,
+            truncated,
+            {key: value for key, value in info.items() if key != "reward"},
+            num_envs=2,
+        )
+
+
+def test_episode_accounting_uses_raw_reward_and_ignores_life_loss_done():
+    statistics = initial_episode_statistics(2)
+    update = jax.jit(update_episode_statistics)
+
+    statistics, events = update(
+        statistics,
+        {
+            "reward": np.asarray([5.0, 2.5]),
+            "terminated": np.asarray([False, False]),
         },
-        "_episode": np.asarray([False, True]),
-    }
-    assert extract_final_episode_stats(infos) == [{"return": 20.0, "length": 8, "time": 0.2}]
-    np.testing.assert_array_equal(episode_end_mask(infos, 2), [False, True])
+        np.asarray([False, False]),
+    )
+    np.testing.assert_array_equal(np.asarray(events.mask), [False, False])
+    np.testing.assert_allclose(np.asarray(statistics.returns), [5.0, 2.5])
 
-
-def test_episode_end_mask_ignores_life_loss_final_info():
-    infos = {
-        "final_info": np.asarray([{"lives": 2}, {"episode": {"r": 10.0, "l": 5}}], dtype=object),
-        "_final_info": np.asarray([True, True]),
-    }
-    np.testing.assert_array_equal(episode_end_mask(infos, 2), [False, True])
-
-
-def test_current_same_step_nested_final_info_layout():
-    life_loss = {
-        "final_info": {"lives": np.asarray([2]), "_lives": np.asarray([True])},
-        "_final_info": np.asarray([True]),
-    }
-    assert extract_final_episode_stats(life_loss) == []
-    np.testing.assert_array_equal(episode_end_mask(life_loss, 1), [False])
-
-    game_over = {
-        "final_info": {
-            "episode": {
-                "r": np.asarray([130.0]),
-                "l": np.asarray([900]),
-                "t": np.asarray([7.5]),
-            },
-            "_episode": np.asarray([True]),
+    # Slot zero can have an episodic-life `done` outside this helper; with no
+    # real termination in info, its real-game accumulator must continue.
+    statistics, events = update(
+        statistics,
+        {
+            "reward": np.asarray([7.0, -4.0]),
+            "terminated": np.asarray([False, True]),
         },
-        "_final_info": np.asarray([True]),
-    }
-    assert extract_final_episode_stats(game_over) == [{"return": 130.0, "length": 900, "time": 7.5}]
-    np.testing.assert_array_equal(episode_end_mask(game_over, 1), [True])
+        np.asarray([False, False]),
+    )
+    np.testing.assert_array_equal(np.asarray(events.mask), [False, True])
+    np.testing.assert_allclose(np.asarray(events.returns), [12.0, -1.5])
+    np.testing.assert_array_equal(np.asarray(events.lengths), [2, 2])
+    np.testing.assert_allclose(np.asarray(statistics.returns), [12.0, 0.0])
+    np.testing.assert_array_equal(np.asarray(statistics.lengths), [2, 0])
+
+    statistics, events = update(
+        statistics,
+        {
+            "reward": np.asarray([1.0, 3.0]),
+            "terminated": np.asarray([False, False]),
+        },
+        np.asarray([True, False]),
+    )
+    np.testing.assert_array_equal(np.asarray(events.mask), [True, False])
+    np.testing.assert_allclose(np.asarray(events.returns), [13.0, 3.0])
+    np.testing.assert_allclose(np.asarray(statistics.returns), [0.0, 3.0])
+
+
+def test_real_envpool_observation_action_and_info_contract_if_available():
+    pytest.importorskip("envpool")
+    env = make_envpool("Frostbite-v5", num_envs=2, seed=[17, 23])
+    try:
+        observation, _ = env.reset()
+        actions = np.zeros((2,), dtype=np.int32)
+        next_observation, reward, terminated, truncated, info = env.step(actions)
+        assert np.shape(observation) == (2, *OBSERVATION_SHAPE)
+        validate_envpool_step(next_observation, reward, terminated, truncated, info, num_envs=2)
+        handle, recv, send, step = env.xla()
+        assert handle is not None
+        assert all(callable(function) for function in (recv, send, step))
+    finally:
+        env.close()

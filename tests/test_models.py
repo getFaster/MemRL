@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -78,6 +80,31 @@ def test_random_retrieval_ignores_similarity_bias() -> None:
         lambda value: retrieve_memories(query, candidates, mode="random", similarity_bias=value).context.sum()
     )(bias)
     np.testing.assert_array_equal(gradient, jnp.zeros_like(bias))
+
+
+def test_random_policy_logits_do_not_depend_on_query_parameters() -> None:
+    agent = RetrievalAgent(action_dim=4, retrieval_mode="random")
+    observations = _observations(batch_size=1)
+    candidates = _candidates(batch_size=1)
+    variables = agent.init(jax.random.PRNGKey(7), observations, candidates)
+    baseline = agent.apply(variables, observations, candidates).logits
+    perturbed = copy.deepcopy(variables)
+    perturbed["params"]["query"] = jax.tree.map(lambda value: value + 1000.0, variables["params"]["query"])
+    changed = agent.apply(perturbed, observations, candidates).logits
+    np.testing.assert_array_equal(changed, baseline)
+
+
+def test_random_query_cosine_path_is_explicit_probe_only() -> None:
+    agent = RetrievalAgent(action_dim=4, retrieval_mode="random")
+    observations = _observations(batch_size=1)
+    candidates = _candidates(batch_size=1)
+    variables = agent.init(jax.random.PRNGKey(8), observations, candidates)
+    output = agent.apply(variables, observations, candidates)
+    np.testing.assert_array_equal(output.query, jnp.zeros((1, 256)))
+    np.testing.assert_array_equal(output.retrieval.similarities, jnp.zeros((1, 5)))
+    query, similarities, _ = agent.apply(variables, observations, candidates, method=agent.retrieval_probe)
+    assert jnp.linalg.norm(query) > 0
+    assert jnp.linalg.norm(similarities) > 0
 
 
 @pytest.mark.parametrize("mode", ["none", "random", "learned"])

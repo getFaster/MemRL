@@ -1,4 +1,4 @@
-"""Checkpoint evaluation, including exact whole-memory learned retrieval."""
+"""Evaluation from one rewritten Orbax checkpoint directory."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import tyro
 
@@ -15,11 +15,9 @@ import tyro
 @dataclass
 class EvalConfig:
     checkpoint: Path
-    memory_checkpoint: Path | None = None
     episodes: int = 10
     seed: int = 10_001
-    retrieval_k: int = 64
-    temperature: float = 0.1
+    num_envs: int = 8
     deterministic_actions: bool = False
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
     wandb_project: str = "memrl-frostbite-eval"
@@ -27,104 +25,131 @@ class EvalConfig:
     xla_memory_fraction: float = 0.55
 
 
-def evaluate(config: EvalConfig) -> dict[str, float]:
+def evaluate(config: EvalConfig) -> dict[str, Any]:
+    if config.episodes < 1 or config.num_envs < 1:
+        raise ValueError("episodes and num_envs must be positive")
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", str(config.xla_memory_fraction))
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-    import flax.serialization
-    import gymnasium as gym
     import jax
     import jax.numpy as jnp
     import numpy as np
 
-    from memrl.envs import extract_final_episode_stats, make_env
-    from memrl.memory import EpisodicMemory, evaluation_retrieval
+    from memrl.checkpointing import restore_checkpoint
+    from memrl.envs import initial_episode_statistics, make_envpool, update_episode_statistics
+    from memrl.memory import DeviceMemoryState, evaluation_retrieval, sample_batch
     from memrl.models import RetrievalAgent
 
-    metadata_path = config.checkpoint.with_suffix(".json")
-    metadata = json.loads(metadata_path.read_text())
-    train_config = metadata["config"]
+    bundle = restore_checkpoint(config.checkpoint)
+    train_config = bundle.metadata["config"]
     mode = train_config["retrieval_mode"]
-    env_id = train_config["env_id"]
-    action_dim = int(metadata["action_dim"])
-    observation_shape = tuple(metadata["observation_shape"])
-    agent = RetrievalAgent(action_dim=action_dim, retrieval_mode=mode, temperature=config.temperature)
-    dummy_obs = jnp.zeros((1, *observation_shape), dtype=jnp.uint8)
-    if mode == "none":
-        variables = agent.init(jax.random.PRNGKey(0), dummy_obs)
-    else:
-        dummy_candidates = jnp.zeros((1, config.retrieval_k, 256), dtype=jnp.float32)
-        variables = agent.init(jax.random.PRNGKey(0), dummy_obs, dummy_candidates)
-    params = flax.serialization.from_bytes(variables, config.checkpoint.read_bytes())
+    retrieval_k = int(train_config["retrieval_k"])
+    temperature = float(train_config["temperature"])
+    action_dim = int(bundle.metadata["action_dim"])
+    state_payload = bundle.training["state"]
+    params = state_payload.params if hasattr(state_payload, "params") else state_payload["params"]
+    agent = RetrievalAgent(action_dim=action_dim, retrieval_mode=mode, temperature=temperature)
 
     memory = None
-    all_memory = None
+    whole_memory = None
     if mode != "none":
-        memory_path = config.memory_checkpoint or config.checkpoint.with_name("memory.npz")
-        memory = EpisodicMemory.load(memory_path, seed=config.seed)
-        all_memory = memory.all(include_frames=False).embeddings
-        if len(memory) == 0:
+        raw_memory = bundle.training["memory"]
+        memory = raw_memory if isinstance(raw_memory, DeviceMemoryState) else DeviceMemoryState(**raw_memory)
+        size = int(memory.size)
+        if size == 0:
             raise ValueError("retrieval checkpoint memory is empty")
+        oldest = int(memory.next_index) if size == memory.capacity else 0
+        physical = (oldest + np.arange(size, dtype=np.int32)) % memory.capacity
+        whole_memory = memory.embeddings[jnp.asarray(physical)]
 
-    env = gym.vector.SyncVectorEnv(
-        [make_env(env_id, config.seed, 0, False, "evaluation", config.output_dir)],
-        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
-    )
-    obs, _ = env.reset(seed=[config.seed])
+    env = make_envpool(train_config["env_id"], num_envs=config.num_envs, seed=config.seed)
+    handle, _recv, _send, step_env = env.xla()
+    obs, _ = env.reset()
+    obs = jnp.asarray(obs)
     action_key = jax.random.PRNGKey(config.seed)
     retrieval_key = jax.random.PRNGKey(config.seed + 1)
+    episode_statistics = initial_episode_statistics(config.num_envs)
     returns: list[float] = []
     lengths: list[int] = []
     retrieval_entropies: list[float] = []
+    episode_rows: list[dict[str, int | float | str]] = []
+    global_step = 0
+
+    @jax.jit
+    def evaluation_step(env_handle, observation, stats, policy_key, retrieval_rng):
+        entropy = jnp.asarray(0.0)
+        if mode == "none":
+            output = agent.apply(params, observation)
+            logits = output.logits
+        elif mode == "random":
+            sample = sample_batch(memory, retrieval_rng, config.num_envs, retrieval_k)
+            retrieval_rng = sample.key
+            output = agent.apply(params, observation, sample.embeddings)
+            logits = output.logits
+        else:
+            dummy = jnp.zeros((config.num_envs, retrieval_k, int(train_config["memory_dim"])), dtype=jnp.float32)
+            preliminary = agent.apply(params, observation, dummy)
+            retrieval_rng, sample_key = jax.random.split(retrieval_rng)
+            retrieved = evaluation_retrieval(sample_key, preliminary.query, whole_memory, retrieval_k, temperature)
+            logits = agent.apply(params, observation, retrieved.context, method=agent.apply_retrieved_context)[0]
+            entropy = -jnp.sum(
+                retrieved.probabilities * jnp.log(jnp.maximum(retrieved.probabilities, 1e-8)), axis=-1
+            ).mean()
+        policy_key, sample_key = jax.random.split(policy_key)
+        action = (
+            jnp.argmax(logits, axis=-1)
+            if config.deterministic_actions
+            else jax.random.categorical(sample_key, logits, axis=-1)
+        ).astype(jnp.int32)
+        env_handle, (observation, _reward, _terminated, truncated, info) = step_env(env_handle, action)
+        stats, events = update_episode_statistics(stats, info, truncated)
+        return env_handle, observation, stats, policy_key, retrieval_rng, events, entropy
+
     run = None
     if config.wandb_mode != "disabled":
         import wandb
 
-        eval_config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(config).items()}
         run = wandb.init(
             project=config.wandb_project,
             mode=config.wandb_mode,
             name=f"eval__{mode}__{int(time.time())}",
-            config={**eval_config, "training_config": train_config},
+            config={
+                **{key: str(value) if isinstance(value, Path) else value for key, value in vars(config).items()},
+                "training_config": train_config,
+            },
         )
 
     try:
         while len(returns) < config.episodes:
-            if mode == "none":
-                output = agent.apply(params, obs)
-                logits = output.logits
-            elif mode == "random":
-                assert memory is not None
-                sample = memory.sample_candidates(config.retrieval_k, include_frames=False)
-                candidates = sample.embeddings[None, ...]
-                output = agent.apply(params, obs, candidates)
-                logits = output.logits
-            else:
-                assert all_memory is not None
-                # Obtain the current query, score every resident memory exactly,
-                # sample K from p(i|k), then aggregate the sampled h by plain mean.
-                dummy_candidates = jnp.zeros((1, config.retrieval_k, 256), dtype=jnp.float32)
-                preliminary = agent.apply(params, obs, dummy_candidates)
-                retrieval_key, sample_key = jax.random.split(retrieval_key)
-                retrieved = evaluation_retrieval(
-                    sample_key, preliminary.query, jnp.asarray(all_memory), config.retrieval_k, config.temperature
+            handle, obs, episode_statistics, action_key, retrieval_key, events, entropy = evaluation_step(
+                handle, obs, episode_statistics, action_key, retrieval_key
+            )
+            event_mask, event_returns, event_lengths, host_entropy = jax.device_get(
+                (events.mask, events.returns, events.lengths, entropy)
+            )
+            global_step += config.num_envs
+            if mode == "learned":
+                retrieval_entropies.append(float(host_entropy))
+            for env_slot in np.flatnonzero(event_mask):
+                episode_return = float(event_returns[env_slot])
+                episode_length = int(event_lengths[env_slot])
+                returns.append(episode_return)
+                lengths.append(episode_length)
+                episode_rows.append(
+                    {
+                        "mode": mode,
+                        "seed": config.seed,
+                        "env_slot": int(env_slot),
+                        "completion_step": global_step,
+                        "raw_return": episode_return,
+                        "length": episode_length,
+                    }
                 )
-                logits, _, _, _ = agent.apply(params, obs, retrieved.context, method=agent.apply_retrieved_context)
-                probabilities = np.asarray(retrieved.probabilities)
-                entropy = -(probabilities * np.log(np.maximum(probabilities, 1e-8))).sum(axis=-1)
-                retrieval_entropies.append(float(entropy.mean()))
-
-            action_key, sample_key = jax.random.split(action_key)
-            if config.deterministic_actions:
-                action = jnp.argmax(logits, axis=-1)
-            else:
-                action = jax.random.categorical(sample_key, logits, axis=-1)
-            obs, _, _, _, infos = env.step(np.asarray(action))
-            for episode in extract_final_episode_stats(infos):
-                returns.append(float(episode["return"]))
-                lengths.append(int(episode["length"]))
                 if run is not None:
-                    run.log({"eval/episodic_return": episode["return"], "eval/episodic_length": episode["length"]})
+                    run.log(
+                        {"eval/episodic_return": episode_return, "eval/episodic_length": episode_length},
+                        step=global_step,
+                    )
                 if len(returns) >= config.episodes:
                     break
     finally:
@@ -133,15 +158,20 @@ def evaluate(config: EvalConfig) -> dict[str, float]:
             run.finish()
 
     result = {
+        "training_mode": mode,
+        "training_seed": int(train_config["seed"]),
+        "evaluation_seed": config.seed,
         "mean_return": float(np.mean(returns)),
         "std_return": float(np.std(returns)),
         "mean_length": float(np.mean(lengths)),
         "episodes": float(len(returns)),
+        "diagnostics_frame_coverage": bundle.frame_coverage,
     }
     if retrieval_entropies:
         result["mean_whole_memory_entropy"] = float(np.mean(retrieval_entropies))
     config.output_dir.mkdir(parents=True, exist_ok=True)
     (config.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
+    (config.output_dir / "episodes.jsonl").write_text("".join(json.dumps(row) + "\n" for row in episode_rows))
     print(json.dumps(result, indent=2))
     return result
 

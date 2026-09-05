@@ -1,6 +1,9 @@
+import ast
+import inspect
+
 import pytest
 
-from memrl.train import _finite_float
+from memrl.train import _finite_float, train
 
 
 def test_nonfinite_update_metrics_fail_fast():
@@ -9,3 +12,23 @@ def test_nonfinite_update_metrics_fail_fast():
         _finite_float(float("nan"))
     with pytest.raises(FloatingPointError):
         _finite_float(float("inf"))
+
+
+def test_compiled_rollout_and_update_regions_have_no_host_callbacks():
+    tree = ast.parse(inspect.getsource(train))
+    compiled_names = {"rollout_retrieval", "rollout_none", "update_ppo"}
+    compiled = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in compiled_names
+    }
+    assert compiled.keys() == compiled_names
+
+    forbidden = {"callback", "device_get", "io_callback", "pure_callback"}
+    for name, function in compiled.items():
+        calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name))
+        }
+        assert calls.isdisjoint(forbidden), f"{name} contains a host callback: {calls & forbidden}"
