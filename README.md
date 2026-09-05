@@ -146,7 +146,12 @@ uv run memrl-matrix --max-parallel 2 --resource-report canary-resources.json
 ```
 
 `memrl-canary` runs two learned 200k-step processes concurrently, samples GPU/host/swap usage, verifies their
-frame-complete final checkpoints, and prints and writes the resource report.
+frame-complete final checkpoints, and prints and writes the resource report. It uses seeds 901 and 902 by default,
+writes logs under `canary-runs/`, checkpoints under `canary-checkpoints/`, and requires `nvidia-smi` for GPU
+sampling. The report contains `learned_processes`, `full_host_frames`, `frame_complete_checkpoint`,
+`combined_peak_vram_bytes`, `min_mem_available_bytes`, and `swap_growth_bytes`; the matrix accepts it only when
+the two processes complete and the limits above pass. Override paths or duration with options such as
+`--total-timesteps`, `--output-dir`, `--checkpoint-dir`, and `--sample-interval`.
 
 After every gate passes, run seeds 1-3 for all three modes at the frozen 10M-step budget. Every completed episode is
 written to `episodes.jsonl` with mode, seed, environment slot, completion step, raw return, and length.
