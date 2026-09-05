@@ -32,9 +32,14 @@ embeddings are inserted. Warm-up sampling is uniform with replacement; once size
 Floyd sampler draws a uniform subset without replacement. It never creates a memory-sized permutation or score
 vector.
 
-Memory stores raw 512D encoder features with no deterministic projection. The query MLP is
-512 -> 512 -> 512; retrieval context is 512D. Both retrieval actor and critic take the concatenated
-512D observation and 512D context (1024D total), while `none` keeps 512D inputs. Cosine normalization
+The Atari encoder is Conv -> GELU -> Conv -> GELU -> Conv -> GELU -> Dense(512) -> GELU.
+All GELUs use the tanh approximation (`approximate=True`). Encoder layers and both query dense
+layers use unit-gain orthogonal initialization with zero biases; actor and critic output gains
+remain 0.01 and 1, respectively.
+
+Memory stores raw 512D encoder features with no deterministic projection. The query MLP takes
+512D input and applies Dense(512) -> GELU -> Dense(512); retrieval context is 512D. Both retrieval actor and
+critic take the concatenated 512D observation and 512D context (1024D total), while `none` keeps 512D inputs. Cosine normalization
 is used only for scoring. The float32 embedding FIFO alone occupies 204.8 MB at full capacity;
 candidate buffers require additional memory. Retrieval training requires `memory_dim=512`.
 

@@ -13,7 +13,6 @@ from typing import Literal
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import struct
 from flax.linen.initializers import constant, orthogonal
 
@@ -130,7 +129,7 @@ def retrieve_memories(
 
 
 class AtariEncoder(nn.Module):
-    """CleanRL's three-convolution Atari encoder with a 512-D output."""
+    """Three-convolution Atari encoder with GELU and a 512-D output."""
 
     @nn.compact
     def __call__(self, observations: jax.Array) -> jax.Array:
@@ -149,53 +148,53 @@ class AtariEncoder(nn.Module):
             kernel_size=(8, 8),
             strides=(4, 4),
             padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="conv1",
         )(x)
-        x = nn.relu(x)
+        x = nn.gelu(x, approximate=True)
         x = nn.Conv(
             64,
             kernel_size=(4, 4),
             strides=(2, 2),
             padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="conv2",
         )(x)
-        x = nn.relu(x)
+        x = nn.gelu(x, approximate=True)
         x = nn.Conv(
             64,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="conv3",
         )(x)
-        x = nn.relu(x)
+        x = nn.gelu(x, approximate=True)
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(
             512,
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="dense",
         )(x)
-        return nn.relu(x)
+        return nn.gelu(x, approximate=True)
 
 
 class QueryNetwork(nn.Module):
-    """Small 512 -> 512 -> 512 MLP used by learned retrieval."""
+    """512 -> GELU -> 512 query MLP with a 512-D input."""
 
     @nn.compact
     def __call__(self, z: jax.Array) -> jax.Array:
         x = nn.Dense(
             512,
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="dense1",
         )(z)
-        x = nn.relu(x)
+        x = nn.gelu(x, approximate=True)
         return nn.Dense(
             512,
             kernel_init=orthogonal(1.0),

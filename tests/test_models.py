@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from memrl.models import RetrievalAgent, retrieve_memories
+from memrl.models import AtariEncoder, QueryNetwork, RetrievalAgent, retrieve_memories
 
 
 def _observations(batch_size: int = 2) -> jax.Array:
@@ -109,6 +109,8 @@ def test_agent_mode_switching_and_shapes(mode: str) -> None:
     variables = agent.init(jax.random.PRNGKey(0), observations, candidates, similarity_bias=similarity_bias)
     output = agent.apply(variables, observations, candidates, similarity_bias=similarity_bias)
 
+    for leaf in jax.tree_util.tree_leaves(output):
+        assert np.isfinite(np.asarray(leaf)).all()
     assert output.logits.shape == (2, 6)
     assert output.value.shape == (2, 1)
     assert output.observation_embedding.shape == (2, 512)
@@ -149,7 +151,10 @@ def _query_gradient_norm(mode: str) -> float:
         output = agent.apply({"params": params}, observations, candidates)
         return jnp.square(output.logits).sum() + jnp.square(output.value).sum()
 
-    grads = jax.grad(loss)(variables["params"])["query"]
+    all_grads = jax.grad(loss)(variables["params"])
+    for leaf in jax.tree_util.tree_leaves(all_grads):
+        assert np.isfinite(np.asarray(leaf)).all()
+    grads = all_grads["query"]
     return float(sum(jnp.vdot(leaf, leaf) for leaf in jax.tree_util.tree_leaves(grads)))
 
 
@@ -188,3 +193,43 @@ def test_external_context_matches_policy_and_rejects_old_width(mode):
         np.testing.assert_allclose(actual, expected)
     with pytest.raises(ValueError, match="retrieval context must have shape"):
         agent.apply(variables, observations, jnp.zeros((1, 256)), method=agent.apply_retrieved_context)
+
+
+def test_encoder_applies_approximate_gelu_at_all_four_layers():
+    encoder = AtariEncoder()
+    observations = jnp.full((1, 4, 84, 84), 255, dtype=jnp.uint8)
+    variables = encoder.init(jax.random.PRNGKey(20), observations)
+    # A single unit-weight path isolates the four activation functions.
+    for layer in variables["params"].values():
+        kernel = jnp.zeros_like(layer["kernel"])
+        layer["kernel"] = kernel.at[(0,) * kernel.ndim].set(1.0)
+        layer["bias"] = jnp.zeros_like(layer["bias"])
+    expected = jnp.asarray(1.0)
+    for _ in range(4):
+        expected = jax.nn.gelu(expected, approximate=True)
+    output = encoder.apply(variables, observations)
+    np.testing.assert_allclose(output[0, 0], expected, rtol=1e-6)
+    np.testing.assert_array_equal(output[0, 1:], jnp.zeros(511))
+
+
+def test_query_uses_approximate_gelu_and_linear_output():
+    query = QueryNetwork()
+    inputs = jnp.linspace(-3.0, 3.0, 512).reshape(1, 512)
+    variables = query.init(jax.random.PRNGKey(21), inputs)
+    for layer in variables["params"].values():
+        layer["kernel"] = jnp.eye(512)
+        layer["bias"] = jnp.zeros(512)
+    np.testing.assert_allclose(
+        query.apply(variables, inputs), jax.nn.gelu(inputs, approximate=True), rtol=1e-6, atol=1e-7
+    )
+
+
+def test_unit_orthogonal_initialization_preserves_head_gains():
+    agent = RetrievalAgent(action_dim=6, retrieval_mode="learned")
+    params = agent.init(jax.random.PRNGKey(22), _observations(1), _candidates(1))["params"]
+    for module_name, layers in params.items():
+        gain = 0.01 if module_name == "actor" else 1.0
+        for layer in layers.values():
+            kernel = np.asarray(layer["kernel"]).reshape(-1, layer["kernel"].shape[-1])
+            np.testing.assert_allclose(kernel.T @ kernel, gain**2 * np.eye(kernel.shape[1]), atol=2e-6)
+            np.testing.assert_array_equal(layer["bias"], np.zeros_like(layer["bias"]))
