@@ -333,7 +333,22 @@ def train(config: TrainConfig) -> Path:
         frame_batch = jnp.zeros((config.num_steps, config.num_envs, 84, 84), dtype=jnp.uint8)
         frame_slots = jnp.zeros((config.num_steps, config.num_envs), dtype=jnp.int32)
         frame_insertions = jnp.zeros((config.num_steps, config.num_envs), dtype=jnp.int32)
-        for step in range(config.num_steps):
+
+        def rollout_step(carry, step):
+            (
+                episodes,
+                observation,
+                done,
+                storage,
+                rng,
+                sample_rng,
+                env_handle,
+                mem,
+                summary,
+                frame_batch,
+                frame_slots,
+                frame_insertions,
+            ) = carry
             sample = sample_batch(mem, sample_rng, config.num_envs, config.retrieval_k)
             sample_rng = sample.key
             output, action, logprob, rng = sample_action(policy_params, observation, sample.embeddings, rng)
@@ -371,6 +386,55 @@ def train(config: TrainConfig) -> Path:
                 event_returns=storage.event_returns.at[step].set(events.returns),
                 event_lengths=storage.event_lengths.at[step].set(events.lengths),
             )
+            return (
+                episodes,
+                observation,
+                done,
+                storage,
+                rng,
+                sample_rng,
+                env_handle,
+                mem,
+                summary,
+                frame_batch,
+                frame_slots,
+                frame_insertions,
+            ), None
+
+        (
+            (
+                episodes,
+                observation,
+                done,
+                storage,
+                rng,
+                sample_rng,
+                env_handle,
+                mem,
+                summary,
+                frame_batch,
+                frame_slots,
+                frame_insertions,
+            ),
+            _,
+        ) = jax.lax.scan(
+            rollout_step,
+            (
+                episodes,
+                observation,
+                done,
+                storage,
+                rng,
+                sample_rng,
+                env_handle,
+                mem,
+                summary,
+                frame_batch,
+                frame_slots,
+                frame_insertions,
+            ),
+            jnp.arange(config.num_steps, dtype=jnp.int32),
+        )
         bootstrap = sample_batch(mem, sample_rng, config.num_envs, config.retrieval_k)
         storage = storage.replace(next_candidates=bootstrap.embeddings)
         return (
