@@ -26,11 +26,17 @@ rewards and real game ends come from EnvPool info; PPO boundaries use episodic-l
 
 ## Architecture
 
-Retrieval modes carry a 100,000 x 256 JAX FIFO with embedding, episode, timestep, insertion, size, and write-index
+Retrieval modes carry a 100,000 x 512 JAX FIFO with embedding, episode, timestep, insertion, size, and write-index
 state. `none` does not allocate this state. Each environment samples K=64 candidates before the current eight
 embeddings are inserted. Warm-up sampling is uniform with replacement; once size reaches K, a vectorized fixed-work
 Floyd sampler draws a uniform subset without replacement. It never creates a memory-sized permutation or score
 vector.
+
+Memory stores raw 512D encoder features with no deterministic projection. The query MLP is
+512 -> 512 -> 512; retrieval context is 512D. Both retrieval actor and critic take the concatenated
+512D observation and 512D context (1024D total), while `none` keeps 512D inputs. Cosine normalization
+is used only for scoring. The float32 embedding FIFO alone occupies 204.8 MB at full capacity;
+candidate buffers require additional memory. Retrieval training requires `memory_dim=512`.
 
 Historical embeddings are detached. Candidate tensors are snapshotted in rollout storage and reused unchanged for
 all four PPO epochs. Random retrieval is a direct candidate mean: its query parameters exist for architectural
@@ -77,7 +83,12 @@ uv run memrl-train --retrieval-mode learned --seed 901 \
 
 Resume restores learning state but creates a fresh EnvPool handle. It assigns fresh episode IDs, resets active
 episode statistics, and records the unavoidable emulator-reset discontinuity. Legacy `.msgpack`/`.npz` checkpoints
-are left untouched and rejected; there is no migration path.
+are left untouched and rejected; there is no migration path. Existing 256D retrieval checkpoints are
+also rejected for resume and evaluation before tensor restoration. Start fresh 512D retrieval runs in
+new output directories; existing baseline checkpoints remain architecturally compatible.
+
+The 512D change requires fresh correctness validation. Learning quality and full-capacity throughput
+must be measured separately; prior 256D performance results do not validate the wider architecture.
 
 Evaluation accepts the one directory and freezes retrieval K/temperature from its training metadata:
 

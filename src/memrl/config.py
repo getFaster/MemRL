@@ -30,7 +30,7 @@ class TrainConfig:
 
     retrieval_mode: Literal["none", "random", "learned"] = "none"
     memory_capacity: int = 100_000
-    memory_dim: int = 256
+    memory_dim: int = 512
     retrieval_k: int = 64
     temperature: float = 0.1
     diagnostics_interval: int = 10
@@ -76,6 +76,8 @@ class TrainConfig:
             raise ValueError("num_envs * num_steps must be divisible by num_minibatches")
         if self.memory_capacity < 1 or self.memory_dim < 1 or self.retrieval_k < 1:
             raise ValueError("memory capacity, dimension, and retrieval K must be positive")
+        if self.retrieval_mode != "none" and self.memory_dim != 512:
+            raise ValueError("retrieval requires memory_dim=512 (raw encoder features)")
         if self.retrieval_k > self.memory_capacity:
             raise ValueError("retrieval K cannot exceed memory capacity")
         if self.diagnostics_interval < 1 or self.diagnostics_top_k < 1:

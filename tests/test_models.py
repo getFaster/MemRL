@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from memrl.models import RetrievalAgent, deterministic_memory_projection, retrieve_memories
+from memrl.models import RetrievalAgent, retrieve_memories
 
 
 def _observations(batch_size: int = 2) -> jax.Array:
@@ -16,19 +16,12 @@ def _observations(batch_size: int = 2) -> jax.Array:
 
 
 def _candidates(batch_size: int = 2, count: int = 5) -> jax.Array:
-    values = jnp.arange(batch_size * count * 256, dtype=jnp.float32)
-    return jnp.sin(values / 31.0).reshape(batch_size, count, 256)
-
-
-def test_deterministic_projection_shape_and_values() -> None:
-    z = jnp.arange(1024, dtype=jnp.float32).reshape(2, 512)
-    projected = deterministic_memory_projection(z)
-    assert projected.shape == (2, 256)
-    np.testing.assert_allclose(projected[0, 0], (z[0, 0] + z[0, 1]) / np.sqrt(2))
+    values = jnp.arange(batch_size * count * 512, dtype=jnp.float32)
+    return jnp.sin(values / 31.0).reshape(batch_size, count, 512)
 
 
 def test_retrieval_aggregation_and_metadata() -> None:
-    query = jnp.ones((2, 256), dtype=jnp.float32)
+    query = jnp.ones((2, 512), dtype=jnp.float32)
     candidates = _candidates()
     episode_ids = jnp.arange(10).reshape(2, 5)
     timesteps = episode_ids + 100
@@ -39,7 +32,7 @@ def test_retrieval_aggregation_and_metadata() -> None:
         candidate_episode_ids=episode_ids,
         candidate_timesteps=timesteps,
     )
-    assert output.context.shape == (2, 256)
+    assert output.context.shape == (2, 512)
     assert output.weights.shape == (2, 5)
     assert output.similarities.shape == (2, 5)
     np.testing.assert_allclose(output.weights.sum(axis=-1), 1.0, atol=1e-6)
@@ -48,7 +41,7 @@ def test_retrieval_aggregation_and_metadata() -> None:
 
 
 def test_similarity_bias_changes_learned_retrieval_and_has_gradient() -> None:
-    query = jnp.linspace(-1.0, 1.0, 256).reshape(1, 256)
+    query = jnp.linspace(-1.0, 1.0, 512).reshape(1, 512)
     candidates = _candidates(batch_size=1)
     zero_bias = jnp.zeros((1, 5), dtype=jnp.float32)
     preferred_bias = zero_bias.at[0, 2].set(4.0)
@@ -68,7 +61,7 @@ def test_similarity_bias_changes_learned_retrieval_and_has_gradient() -> None:
 
 
 def test_random_retrieval_ignores_similarity_bias() -> None:
-    query = jnp.linspace(-1.0, 1.0, 256).reshape(1, 256)
+    query = jnp.linspace(-1.0, 1.0, 512).reshape(1, 512)
     candidates = _candidates(batch_size=1)
     bias = jnp.arange(5, dtype=jnp.float32).reshape(1, 5)
     unbiased = retrieve_memories(query, candidates, mode="random")
@@ -100,7 +93,7 @@ def test_random_query_cosine_path_is_explicit_probe_only() -> None:
     candidates = _candidates(batch_size=1)
     variables = agent.init(jax.random.PRNGKey(8), observations, candidates)
     output = agent.apply(variables, observations, candidates)
-    np.testing.assert_array_equal(output.query, jnp.zeros((1, 256)))
+    np.testing.assert_array_equal(output.query, jnp.zeros((1, 512)))
     np.testing.assert_array_equal(output.retrieval.similarities, jnp.zeros((1, 5)))
     query, similarities, _ = agent.apply(variables, observations, candidates, method=agent.retrieval_probe)
     assert jnp.linalg.norm(query) > 0
@@ -119,15 +112,22 @@ def test_agent_mode_switching_and_shapes(mode: str) -> None:
     assert output.logits.shape == (2, 6)
     assert output.value.shape == (2, 1)
     assert output.observation_embedding.shape == (2, 512)
-    assert output.memory_embedding.shape == (2, 256)
-    assert output.retrieval.context.shape == (2, 256)
+    assert output.memory_embedding.shape == (2, 512)
+    np.testing.assert_array_equal(output.memory_embedding, output.observation_embedding)
+    assert output.query.shape == (2, 512)
+    expected_width = 512 if mode == "none" else 1024
+    for head in ("actor", "critic"):
+        assert variables["params"][head]["output"]["kernel"].shape[0] == expected_width
+    assert output.retrieval.context.shape == (2, 512)
     if mode == "none":
         assert "query" not in variables["params"]
         assert output.retrieval.weights.shape == (2, 0)
     else:
         assert "query" in variables["params"]
+        for layer in ("dense1", "dense2"):
+            assert variables["params"]["query"][layer]["kernel"].shape == (512, 512)
         assert output.retrieval.weights.shape == (2, 5)
-        assert variables["params"]["actor"]["output"]["kernel"].shape[0] == 768
+        assert variables["params"]["actor"]["output"]["kernel"].shape[0] == 1024
 
 
 def test_encode_method_accepts_channels_last() -> None:
@@ -136,7 +136,7 @@ def test_encode_method_accepts_channels_last() -> None:
     variables = agent.init(jax.random.PRNGKey(1), observations)
     z, h = agent.apply(variables, observations, method=agent.encode)
     assert z.shape == (1, 512)
-    assert h.shape == (1, 256)
+    assert h.shape == (1, 512)
 
 
 def _query_gradient_norm(mode: str) -> float:
@@ -159,7 +159,7 @@ def test_query_receives_gradient_only_in_learned_mode() -> None:
 
 
 def test_historical_candidate_embeddings_are_detached() -> None:
-    query = jnp.linspace(-1.0, 1.0, 256).reshape(1, 256)
+    query = jnp.linspace(-1.0, 1.0, 512).reshape(1, 512)
     candidates = _candidates(batch_size=1)
 
     def loss(candidate_values):
@@ -167,3 +167,24 @@ def test_historical_candidate_embeddings_are_detached() -> None:
 
     gradients = jax.grad(lambda values: jnp.square(loss(values)).sum())(candidates)
     np.testing.assert_array_equal(gradients, jnp.zeros_like(candidates))
+
+
+@pytest.mark.parametrize("mode", ["random", "learned"])
+def test_external_context_matches_policy_and_rejects_old_width(mode):
+    agent = RetrievalAgent(action_dim=4, retrieval_mode=mode)
+    observations = _observations(batch_size=1)
+    candidates = _candidates(batch_size=1)
+    variables = agent.init(jax.random.PRNGKey(9), observations, candidates)
+    output = agent.apply(variables, observations, candidates)
+    logits, value, query, h = agent.apply(
+        variables, observations, output.retrieval.context, method=agent.apply_retrieved_context
+    )
+    for actual, expected in (
+        (logits, output.logits),
+        (value, output.value),
+        (query, output.query),
+        (h, output.memory_embedding),
+    ):
+        np.testing.assert_allclose(actual, expected)
+    with pytest.raises(ValueError, match="retrieval context must have shape"):
+        agent.apply(variables, observations, jnp.zeros((1, 256)), method=agent.apply_retrieved_context)

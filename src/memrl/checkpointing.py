@@ -152,6 +152,19 @@ def restore_checkpoint(path: Path, training_abstract: Any | None = None) -> Chec
     checkpoint_path = Path(path).resolve()
     _validate_checkpoint_directory(checkpoint_path)
     ocp = _orbax()
+    metadata_reader = ocp.Checkpointer(ocp.JsonCheckpointHandler())
+    try:
+        metadata = dict(metadata_reader.restore(checkpoint_path / "metadata", args=ocp.args.JsonRestore()))
+    finally:
+        metadata_reader.close()
+    if metadata.get("schema_version") != SCHEMA_VERSION or metadata.get("format") != FORMAT_NAME:
+        raise ValueError("unsupported MemRL checkpoint schema")
+    saved_config = metadata.get("config", {})
+    if saved_config.get("retrieval_mode") in {"random", "learned"} and saved_config.get("memory_dim") != 512:
+        raise ValueError(
+            "incompatible retrieval checkpoint: expected memory_dim=512, "
+            f"got {saved_config.get('memory_dim')}; start a fresh run (no migration is provided)"
+        )
     checkpointer = ocp.Checkpointer(_handler())
     try:
         restored = checkpointer.restore(
@@ -164,9 +177,6 @@ def restore_checkpoint(path: Path, training_abstract: Any | None = None) -> Chec
         )
     finally:
         checkpointer.close()
-    metadata = dict(restored.metadata)
-    if metadata.get("schema_version") != SCHEMA_VERSION or metadata.get("format") != FORMAT_NAME:
-        raise ValueError("unsupported MemRL checkpoint schema")
     diagnostics = None
     if metadata.get("frames_saved"):
         diagnostics = {key: np.asarray(value) for key, value in restored.diagnostics.items()}

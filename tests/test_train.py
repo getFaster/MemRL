@@ -32,3 +32,18 @@ def test_compiled_rollout_and_update_regions_have_no_host_callbacks():
             if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name))
         }
         assert calls.isdisjoint(forbidden), f"{name} contains a host callback: {calls & forbidden}"
+
+
+@pytest.mark.parametrize("mode", ["none", "random", "learned"])
+def test_memory_dimension_config(mode):
+    from memrl.config import TrainConfig
+
+    config = TrainConfig(retrieval_mode=mode)
+    assert config.memory_dim == 512
+    config.validate()
+    config.memory_dim = 256
+    if mode == "none":
+        config.validate()
+    else:
+        with pytest.raises(ValueError, match="memory_dim=512"):
+            config.validate()

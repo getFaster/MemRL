@@ -135,7 +135,8 @@ def train(config: TrainConfig) -> Path:
             candidate_episode_ids=jnp.full(candidate_shape, -1, dtype=jnp.int32),
             candidate_timesteps=jnp.full(candidate_shape, -1, dtype=jnp.int32),
             candidate_valid=jnp.zeros(candidate_shape, dtype=jnp.bool_),
-            memory_embeddings=jnp.zeros((*prefix, config.memory_dim), dtype=jnp.float32),
+            # Encoder features are always 512D, including legacy none-mode configs.
+            memory_embeddings=jnp.zeros((*prefix, 512), dtype=jnp.float32),
             actions=jnp.zeros(prefix, dtype=jnp.int32),
             logprobs=jnp.zeros(prefix, dtype=jnp.float32),
             dones=jnp.zeros(prefix, dtype=jnp.float32),

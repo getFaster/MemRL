@@ -43,3 +43,38 @@ def test_legacy_checkpoint_is_rejected(tmp_path) -> None:
     legacy.write_bytes(b"old")
     with pytest.raises(ValueError, match="legacy"):
         restore_checkpoint(legacy)
+
+
+@pytest.mark.orbax
+@pytest.mark.parametrize("mode", ["random", "learned"])
+@pytest.mark.parametrize("abstract", [None, {"missing_tensor": np.zeros((1,))}])
+def test_256d_retrieval_rejected_before_tensor_restore(tmp_path, mode, abstract, monkeypatch):
+    import orbax.checkpoint as ocp
+
+    with MemRLCheckpointManager(tmp_path) as manager:
+        checkpoint = manager.save(
+            "old",
+            {"weights": np.ones((256,))},
+            {"config": {"retrieval_mode": mode, "memory_dim": 256}},
+        )
+
+    def forbidden_restore(*args, **kwargs):
+        pytest.fail("tensor restore ran before dimension validation")
+
+    monkeypatch.setattr(ocp.PyTreeCheckpointHandler, "restore", forbidden_restore)
+    with pytest.raises(ValueError, match="expected memory_dim=512, got 256"):
+        restore_checkpoint(checkpoint, abstract)
+
+
+@pytest.mark.orbax
+@pytest.mark.parametrize("mode,dimension", [("random", 512), ("learned", 512), ("none", 256)])
+def test_supported_architecture_checkpoint_round_trip(tmp_path, mode, dimension):
+    weights = np.arange(2 * dimension, dtype=np.float32).reshape(2, dimension)
+    with MemRLCheckpointManager(tmp_path) as manager:
+        checkpoint = manager.save(
+            "final",
+            {"weights": weights},
+            {"config": {"retrieval_mode": mode, "memory_dim": dimension}},
+        )
+    bundle = restore_checkpoint(checkpoint)
+    np.testing.assert_array_equal(bundle.training["weights"], weights)

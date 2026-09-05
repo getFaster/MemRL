@@ -28,19 +28,6 @@ def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / jnp.maximum(norm, eps)
 
 
-def deterministic_memory_projection(z: jax.Array) -> jax.Array:
-    """Map a 512-D Atari feature to a 256-D memory key without parameters.
-
-    Adjacent feature pairs are averaged with a ``1/sqrt(2)`` projection.  The
-    scaling preserves variance when the two inputs are independent and makes
-    the memory representation deterministic across training and collection.
-    """
-
-    if z.shape[-1] != 512:
-        raise ValueError(f"expected a 512-D observation embedding, got {z.shape[-1]}")
-    return jnp.sum(z.reshape(z.shape[:-1] + (256, 2)), axis=-1) / jnp.sqrt(2.0)
-
-
 @struct.dataclass
 class RetrievalOutput:
     """Retrieved context and diagnostics for one batch of observations."""
@@ -198,19 +185,19 @@ class AtariEncoder(nn.Module):
 
 
 class QueryNetwork(nn.Module):
-    """Small 512 -> 256 -> 256 MLP used by learned retrieval."""
+    """Small 512 -> 512 -> 512 MLP used by learned retrieval."""
 
     @nn.compact
     def __call__(self, z: jax.Array) -> jax.Array:
         x = nn.Dense(
-            256,
+            512,
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
             name="dense1",
         )(z)
         x = nn.relu(x)
         return nn.Dense(
-            256,
+            512,
             kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="dense2",
@@ -259,13 +246,13 @@ class RetrievalAgent(nn.Module):
     def encode(self, observations: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return trainable observation features and detached-storage features.
 
-        The returned memory embedding is not stopped here: collection code can
-        transfer it to its NumPy FIFO.  The retrieval boundary always stops
-        gradients through embeddings read back from that FIFO.
+        Memory uses the raw encoder features without projection or normalization.
+        Device FIFO insertion and retrieval stop gradients through stored features;
+        the observation features remain trainable.
         """
 
         z = self.encoder(observations)
-        return z, deterministic_memory_projection(z)
+        return z, z
 
     def apply_retrieved_context(
         self, observations: jax.Array, context: jax.Array
@@ -276,6 +263,8 @@ class RetrievalAgent(nn.Module):
             raise ValueError("external context is only valid for a retrieval policy")
         z, h = self.encode(observations)
         query = self.query_network(z) if self.retrieval_mode == "learned" else jnp.zeros_like(h)
+        if context.shape != z.shape:
+            raise ValueError(f"retrieval context must have shape {z.shape}; got {context.shape}")
         policy_input = jnp.concatenate((z, jax.lax.stop_gradient(context)), axis=-1)
         return self.actor(policy_input), self.critic(policy_input), query, h
 
@@ -304,9 +293,9 @@ class RetrievalAgent(nn.Module):
         batch_size = z.shape[0]
 
         if self.retrieval_mode == "none":
-            query = jnp.zeros((batch_size, 256), dtype=z.dtype)
+            query = jnp.zeros_like(z)
             retrieval = RetrievalOutput(
-                context=jnp.zeros((batch_size, 256), dtype=z.dtype),
+                context=jnp.zeros_like(z),
                 weights=jnp.zeros((batch_size, 0), dtype=z.dtype),
                 similarities=jnp.zeros((batch_size, 0), dtype=z.dtype),
                 entropy=jnp.zeros((batch_size,), dtype=z.dtype),
