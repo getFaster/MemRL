@@ -19,10 +19,10 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-The shared environment factory maps `FrostbiteNoFrameskip-v4`, `ALE/Frostbite-v5`, and related aliases to
-`Frostbite-v5`. It explicitly fixes eight per-environment seeds, four-frame skip and stack, 30 reset no-ops, FIRE
-reset, episodic life, reward clipping, 84x84 grayscale area resize, and zero sticky-action probability. Raw game
-rewards and real game ends come from EnvPool info; PPO boundaries use episodic-life termination.
+The shared environment factory accepts only `Frostbite-v5`. It explicitly fixes eight per-environment seeds,
+four-frame skip and stack, 30 reset no-ops, FIRE reset, episodic life, reward clipping, 84x84 grayscale area
+resize, and zero sticky-action probability. Raw game rewards and real game ends come from EnvPool info; PPO
+boundaries use episodic-life termination.
 
 ## Architecture
 

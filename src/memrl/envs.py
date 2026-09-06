@@ -17,14 +17,6 @@ import jax.numpy as jnp
 import numpy as np
 
 FROSTBITE_ENV_ID = "Frostbite-v5"
-FROSTBITE_ALIASES = frozenset(
-    {
-        FROSTBITE_ENV_ID,
-        "ALE/Frostbite-v5",
-        "FrostbiteNoFrameskip-v4",
-        "ALE/FrostbiteNoFrameskip-v4",
-    }
-)
 OBSERVATION_SHAPE = (4, 84, 84)
 
 
@@ -43,12 +35,6 @@ class EpisodeEvents(NamedTuple):
     lengths: jax.Array
 
 
-def normalize_env_id(env_id: str) -> str:
-    """Map every supported Frostbite spelling to EnvPool's canonical task ID."""
-
-    return FROSTBITE_ENV_ID if env_id in FROSTBITE_ALIASES else env_id
-
-
 def _environment_seeds(seed: int | Sequence[int], num_envs: int) -> list[int]:
     if num_envs < 1:
         raise ValueError("num_envs must be positive")
@@ -63,8 +49,11 @@ def _environment_seeds(seed: int | Sequence[int], num_envs: int) -> list[int]:
 def envpool_config(env_id: str, num_envs: int = 8, seed: int | Sequence[int] = 1) -> dict[str, Any]:
     """Return the complete, locked EnvPool Atari preprocessing configuration."""
 
+    if env_id != FROSTBITE_ENV_ID:
+        raise ValueError(f"unsupported environment ID {env_id!r}; use {FROSTBITE_ENV_ID!r}")
+
     return {
-        "task_id": normalize_env_id(env_id),
+        "task_id": FROSTBITE_ENV_ID,
         "env_type": "gym",
         "num_envs": num_envs,
         "batch_size": num_envs,
@@ -206,13 +195,11 @@ def update_episode_statistics(
 __all__ = [
     "EpisodeEvents",
     "EpisodeStatistics",
-    "FROSTBITE_ALIASES",
     "FROSTBITE_ENV_ID",
     "OBSERVATION_SHAPE",
     "envpool_config",
     "initial_episode_statistics",
     "make_envpool",
-    "normalize_env_id",
     "real_episode_done",
     "update_episode_statistics",
     "validate_envpool_contract",

@@ -11,7 +11,6 @@ from memrl.envs import (
     envpool_config,
     initial_episode_statistics,
     make_envpool,
-    normalize_env_id,
     update_episode_statistics,
     validate_envpool_contract,
     validate_envpool_step,
@@ -27,19 +26,13 @@ class FakeEnvPool:
         return object(), object(), object(), object()
 
 
-def test_frostbite_aliases_normalize_to_envpool_task():
-    for alias in (
-        "Frostbite-v5",
-        "ALE/Frostbite-v5",
-        "FrostbiteNoFrameskip-v4",
-        "ALE/FrostbiteNoFrameskip-v4",
-    ):
-        assert normalize_env_id(alias) == "Frostbite-v5"
-    assert normalize_env_id("Pong-v5") == "Pong-v5"
+def test_only_canonical_frostbite_id_is_supported():
+    with pytest.raises(ValueError, match="use 'Frostbite-v5'"):
+        envpool_config("FrostbiteNoFrameskip-v4")
 
 
 def test_locked_envpool_configuration_is_explicit():
-    config = envpool_config("ALE/Frostbite-v5", num_envs=3, seed=11)
+    config = envpool_config("Frostbite-v5", num_envs=3, seed=11)
     assert config == {
         "task_id": "Frostbite-v5",
         "env_type": "gym",
@@ -75,7 +68,7 @@ def test_make_envpool_calls_native_factory_and_adds_vector_contract(monkeypatch)
         return fake_env
 
     monkeypatch.setattr("memrl.envs.import_module", lambda name: SimpleNamespace(make=fake_make))
-    result = make_envpool("FrostbiteNoFrameskip-v4", num_envs=2, seed=7)
+    result = make_envpool("Frostbite-v5", num_envs=2, seed=7)
 
     assert result is fake_env
     assert captured["task_id"] == "Frostbite-v5"
